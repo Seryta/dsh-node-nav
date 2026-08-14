@@ -28,31 +28,48 @@ window.__ModuleLoader__.load({
 		const PREVIEW_CHARS = 300
 		const LOAD_BATCH_MAX = 30
 
-		/** 用户消息列表共享缓存：sessionId → { at, users:[{id,time,text}] }（导航与输入历史共用）。 */
+		/** 用户消息列表共享缓存：sessionId → users:[{id,time,text}]（导航与输入历史共用）。 */
 		var usersCache = new Map()
-		/** force=false 命中缓存立即返回；force=true 强制重拉（DOM 变化后的防抖刷新）。 */
+		/** 缓存会话数上限：超出按插入序淘汰最旧（Map 迭代序即插入序）。 */
+		var USERS_CACHE_MAX = 10
+		/** 在途请求：sessionId → promise（去重：导航/历史/重拉并发时只发一次请求）。 */
+		var inflightUsers = new Map()
+		/**
+		 * force=false 命中缓存立即返回；force=true 强制重拉（DOM 变化后的
+		 * 防抖刷新）。并发去重：同会话在途请求共享一个 promise（数据是最
+		 * 近 800ms 内的，足够新）。不做 [图片] 过滤——导航节点串保留全部
+		 * 用户消息（含纯图片），输入历史模块按需自行过滤。
+		 */
 		function sharedFetchUsers(sessionId, force) {
 			if (typeof sessionId !== "string" || sessionId === "") return Promise.resolve([])
 			if (!force) {
 				const hit = usersCache.get(sessionId)
-				if (hit !== undefined) return Promise.resolve(hit.users)
+				if (hit !== undefined) return Promise.resolve(hit)
 			}
+			const pending = inflightUsers.get(sessionId)
+			if (pending !== undefined) return pending
 			const url = new URL("/plugins/dsh-node-nav/api/users", window.location.origin)
 			url.searchParams.set("sessionId", sessionId)
-			return fetch(url.href)
+			const promise = fetch(url.href)
 				.then((r) => r.json())
 				.then((data) => {
 					if (!data || !Array.isArray(data.users)) return []
 					const users = data.users
-						.filter((u) => u && typeof u.text === "string" && u.text !== "" && u.text !== "[图片]")
+						.filter((u) => u && typeof u.text === "string" && u.text !== "")
 						.map((u) => ({ id: u.id, time: u.time, text: u.text }))
-					usersCache.set(sessionId, { at: Date.now(), users })
+					if (usersCache.size >= USERS_CACHE_MAX) usersCache.delete(usersCache.keys().next().value)
+					usersCache.set(sessionId, users)
 					return users
 				})
 				.catch(() => {
 					const hit = usersCache.get(sessionId)
-					return hit !== undefined ? hit.users : []
+					return hit !== undefined ? hit : []
 				})
+				.finally(() => {
+					inflightUsers.delete(sessionId)
+				})
+			inflightUsers.set(sessionId, promise)
+			return promise
 		}
 
 		/** 对话流容器动态查询(会话切换后容器可能被替换)。 */
@@ -435,9 +452,12 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 		 * 不等=用户编辑/发送/清空 → 重置 pos=len。多条等值历史天然幂等。
 		 *
 		 * 契约：provide 通道 hooks.input（InputState store）+
-		 * props.inputActions.setDraft(text)（官方单写入口，提交阶段自动拒写）；
+		 * props.inputActions.setDraft(text)（官方单写入口；官方 onDraftChanged
+		 * 无 phase 守卫，提交阶段的拒写由本模块的 phase!=='plain' 检查 +
+		 * textarea readOnly 兜底）；
 		 * 按键走 document 捕获阶段，目标必须位于 [data-composer-card] 内
 		 * （composer textarea），菜单打开时 draft 必含触发词、天然不抢键。
+		 * 纯图片消息（text 为 [图片] 占位）不参与历史。
 		 */
 		function installInputHistory(ctx) {
 			let sessionId = undefined
@@ -456,12 +476,15 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 				if (disposed) return
 				const info = ctx.sessions.currentProvideInfo.getSnapshot()
 				const nextId = info && info.sessionId !== undefined ? info.sessionId : undefined
-				if (nextId === sessionId && input !== undefined) return
+				const nextInput = info && info.hooks ? info.hooks.input : undefined
+				// 身份守卫：sessionId 相同且 input store 身份未变才视为已装配；
+				// HMR 重载后 provide bundle 重建、input store 换身份，必须重新订阅。
+				if (nextId === sessionId && input !== undefined && input === nextInput) return
 				sessionId = nextId
 				pos = 0
 				users = []
 				if (unsub) { unsub(); unsub = undefined }
-				input = info && info.hooks ? info.hooks.input : undefined
+				input = nextInput
 				actions = info && info.props ? info.props.inputActions : undefined
 				if (input && typeof input.subscribe === "function") {
 					unsub = input.subscribe(onInputChange)
@@ -469,7 +492,7 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 				if (sessionId !== undefined && sessionId !== "") {
 					sharedFetchUsers(sessionId, false).then((list) => {
 						if (disposed || sessionId !== nextId) return
-						users = list
+						users = list.filter((u) => u.text !== "[图片]")
 						if (pos > users.length) pos = users.length
 					})
 				}
