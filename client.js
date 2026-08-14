@@ -165,6 +165,13 @@ window.__ModuleLoader__.load({
 		const CSS_TEXT = `
 .dsh-node-nav-rail { position: fixed; right: 28px; top: 50%; transform: translateY(-50%); width: 16px; max-height: calc(100vh - 32px); overflow-y: auto; scrollbar-width: none; z-index: 1000; display: flex; flex-direction: column; align-items: center; gap: 9px; padding: 14px 0; }
 .dsh-node-nav-rail::-webkit-scrollbar { display: none; }
+.dsh-node-nav-rail::before, .dsh-node-nav-rail::after { content: ""; position: absolute; left: 0; right: 0; height: 18px; pointer-events: none; opacity: 0; transition: opacity 0.2s; border-radius: 8px; }
+.dsh-node-nav-rail::before { top: 0; background: linear-gradient(to bottom, rgba(0,0,0,0.14), transparent); }
+.dsh-node-nav-rail::after { bottom: 0; background: linear-gradient(to top, rgba(0,0,0,0.14), transparent); }
+.dsh-node-nav-has-up::before { opacity: 1; }
+.dsh-node-nav-has-down::after { opacity: 1; }
+body[data-ds-dark-theme] .dsh-node-nav-rail::before { background: linear-gradient(to bottom, rgba(255,255,255,0.18), transparent); }
+body[data-ds-dark-theme] .dsh-node-nav-rail::after { background: linear-gradient(to top, rgba(255,255,255,0.18), transparent); }
 .dsh-node-nav-line { position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; margin-left: -1px; border-radius: 1px; background: linear-gradient(to bottom, transparent, rgba(127,127,127,0.42) 10%, rgba(127,127,127,0.42) 90%, transparent); }
 .dsh-node-nav-dot { position: relative; flex: none; width: 11px; height: 11px; border-radius: 50%; background: #ffffff; border: 2px solid rgba(99,102,241,0.55); padding: 0; box-sizing: border-box; cursor: pointer; box-shadow: 0 0 0 3px rgba(255,255,255,0.55); transition: transform 0.15s ease, background 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease; }
 .dsh-node-nav-dot:hover { transform: scale(1.4); background: rgba(99,102,241,0.95); border-color: rgba(99,102,241,1); box-shadow: 0 0 0 5px rgba(99,102,241,0.16); }
@@ -394,24 +401,38 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 
 			const visible = roster.length >= 2 && flowOf() !== null
 
-			const items = roster.map((entry, i) => {
-				const isActive = i === activeIdx
+			// 显示窗口：最多 WINDOW 个节点，窗口随 active 平移（阅读到哪里、
+			// 节点串滑到哪里，无需滚动条）；窗口外两端用渐隐提示。
+			const WINDOW = 15
+			let windowStart = 0
+			let windowRoster = roster
+			if (roster.length > WINDOW) {
+				const half = Math.floor((WINDOW - 1) / 2)
+				windowStart = Math.min(Math.max(activeIdx - half, 0), roster.length - WINDOW)
+				windowRoster = roster.slice(windowStart, windowStart + WINDOW)
+			}
+			const hasMoreUp = windowStart > 0
+			const hasMoreDown = windowStart + WINDOW < roster.length
+
+			const items = windowRoster.map((entry, i) => {
+				const globalIdx = windowStart + i
+				const isActive = globalIdx === activeIdx
 				const unloaded = entry.el === null || entry.el === undefined
 				return react.createElement("button", {
-					key: entry.id !== undefined ? entry.id : `dom-${i}`,
+					key: entry.id !== undefined ? entry.id : `dom-${globalIdx}`,
 					className: "dsh-node-nav-dot"
 						+ (isActive ? " dsh-node-nav-dot-active" : "")
 						+ (unloaded ? " dsh-node-nav-dot-unloaded" : ""),
-					"aria-label": `跳转到消息 ${entry.time ? hhmm(entry.time) : `#${i + 1}`}${unloaded ? '(未加载)' : ''}`,
-					onMouseEnter: () => { setHoverIdx(i); showTextPreview(entry.preview, entry.time, railRef.current ? railRef.current.children[i + 1] : null) },
+					"aria-label": `跳转到消息 ${entry.time ? hhmm(entry.time) : `#${globalIdx + 1}`}${unloaded ? '(未加载)' : ''}`,
+					onMouseEnter: () => { setHoverIdx(globalIdx); showTextPreview(entry.preview, entry.time, railRef.current ? railRef.current.children[i + 1] : null) },
 					onMouseLeave: () => { setHoverIdx(-1); hidePreview() },
-					onFocus: () => { setHoverIdx(i); showTextPreview(entry.preview, entry.time, railRef.current ? railRef.current.children[i + 1] : null) },
+					onFocus: () => { setHoverIdx(globalIdx); showTextPreview(entry.preview, entry.time, railRef.current ? railRef.current.children[i + 1] : null) },
 					onBlur: () => { setHoverIdx(-1); hidePreview() },
 					onClick: () => { void onNodeClick(entry) },
 				})
 			})
 
-			const bottomIdx = roster.length + 1
+			const bottomIdx = windowRoster.length + 1
 			items.push(react.createElement("button", {
 				key: "__bottom",
 				className: "dsh-node-nav-bottom",
@@ -433,7 +454,9 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 					"div",
 					{
 						ref: railRef,
-						className: "dsh-node-nav-rail",
+						className: "dsh-node-nav-rail"
+							+ (hasMoreUp ? " dsh-node-nav-has-up" : "")
+							+ (hasMoreDown ? " dsh-node-nav-has-down" : ""),
 						role: "complementary",
 						"aria-label": "对话节点导航",
 						style: { right: `${detailsWidth > 0 ? detailsWidth + 18 : 28}px` },
