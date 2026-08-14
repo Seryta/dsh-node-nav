@@ -287,18 +287,26 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 				}
 			}, [])
 
-			// active 药丸:视口内最顶部已加载 user 行
+			// active 药丸:视口内最顶部的已加载节点行（数据源与节点串同源——
+			// roster 的锚点行；不再扫 DOM userRows，避免 assistant/steering 等
+			// 非用户消息行混入导致 DOM 序与节点序错位）。activeIdx 即 roster
+			// 全局索引，无需再映射。
 			react.useEffect(() => {
 				const compute = () => {
-					const rows = userRows()
-					if (rows.length === 0) { setActiveIdx(-1); return }
 					let best = -1
 					let bestTop = Number.POSITIVE_INFINITY
-					for (let i = 0; i < rows.length; i++) {
-						const top = rows[i].getBoundingClientRect().top
+					for (let i = 0; i < roster.length; i++) {
+						const el = roster[i].el
+						if (el === null || el === undefined) continue
+						const top = el.getBoundingClientRect().top
 						if (top >= 0 && top < bestTop) { bestTop = top; best = i }
 					}
-					if (best === -1) best = rows.length - 1
+					if (best === -1) {
+						// 视口内无用户行（滚到底/长输出）：取最后一条已加载节点
+						for (let i = roster.length - 1; i >= 0; i--) {
+							if (roster[i].el !== null && roster[i].el !== undefined) { best = i; break }
+						}
+					}
 					setActiveIdx((prev) => (prev === best ? prev : best))
 				}
 				let ticking = false
@@ -341,14 +349,7 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 			} else {
 				roster = userRows().map((el) => ({ id: undefined, time: undefined, preview: rowPreview(el), el }))
 			}
-			// active 药丸映射:按已加载行序计算当前行索引
-			const loadedIdxs = []
-			roster.forEach((entry, i) => { if (entry.el !== null && entry.el !== undefined) loadedIdxs.push(i) })
-			let activeLoadedIdx = -1
-			for (const i of loadedIdxs) {
-				if (i >= activeIdx) { activeLoadedIdx = i; break }
-			}
-			if (activeLoadedIdx === -1 && loadedIdxs.length > 0) activeLoadedIdx = loadedIdxs[loadedIdxs.length - 1]
+			// activeIdx 即 roster 全局索引（scroll-spy 已与节点串同源，无需映射）。
 
 			const showTextPreview = (text, time, anchorEl) => {
 				if (anchorEl === null || anchorEl === undefined) return
@@ -394,7 +395,7 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 			const visible = roster.length >= 2 && flowOf() !== null
 
 			const items = roster.map((entry, i) => {
-				const isActive = i === activeLoadedIdx
+				const isActive = i === activeIdx
 				const unloaded = entry.el === null || entry.el === undefined
 				return react.createElement("button", {
 					key: entry.id !== undefined ? entry.id : `dom-${i}`,
