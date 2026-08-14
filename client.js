@@ -28,6 +28,33 @@ window.__ModuleLoader__.load({
 		const PREVIEW_CHARS = 300
 		const LOAD_BATCH_MAX = 30
 
+		/** 用户消息列表共享缓存：sessionId → { at, users:[{id,time,text}] }（导航与输入历史共用）。 */
+		var usersCache = new Map()
+		/** force=false 命中缓存立即返回；force=true 强制重拉（DOM 变化后的防抖刷新）。 */
+		function sharedFetchUsers(sessionId, force) {
+			if (typeof sessionId !== "string" || sessionId === "") return Promise.resolve([])
+			if (!force) {
+				const hit = usersCache.get(sessionId)
+				if (hit !== undefined) return Promise.resolve(hit.users)
+			}
+			const url = new URL("/plugins/dsh-node-nav/api/users", window.location.origin)
+			url.searchParams.set("sessionId", sessionId)
+			return fetch(url.href)
+				.then((r) => r.json())
+				.then((data) => {
+					if (!data || !Array.isArray(data.users)) return []
+					const users = data.users
+						.filter((u) => u && typeof u.text === "string" && u.text !== "" && u.text !== "[图片]")
+						.map((u) => ({ id: u.id, time: u.time, text: u.text }))
+					usersCache.set(sessionId, { at: Date.now(), users })
+					return users
+				})
+				.catch(() => {
+					const hit = usersCache.get(sessionId)
+					return hit !== undefined ? hit.users : []
+				})
+		}
+
 		/** 对话流容器动态查询(会话切换后容器可能被替换)。 */
 		function flowOf() {
 			return document.querySelector('[data-chat-flow=""]')
@@ -206,15 +233,10 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 				let timer = 0
 				const fetchUsers = () => {
 					timer = 0
-					const id = sessionId
-					if (typeof id !== 'string' || id === '') { setRemoteUsers([]); return }
-					const url = new URL('/plugins/dsh-node-nav/api/users', window.location.origin)
-					url.searchParams.set('sessionId', id)
-					fetch(url.href)
-						.then((r) => r.json())
-						.then((data) => {
-							if (!data || !Array.isArray(data.users)) { setRemoteUsers([]); return }
-							setRemoteUsers(data.users.map((u) => ({ id: u.id, time: u.time, text: u.text })))
+					if (typeof sessionId !== "string" || sessionId === "") { setRemoteUsers([]); return }
+					sharedFetchUsers(sessionId, true)
+						.then((users) => {
+							setRemoteUsers(users.map((u) => ({ id: u.id, time: u.time, text: u.text })))
 						})
 						.catch(() => { setRemoteUsers([]) })
 				}
@@ -404,17 +426,135 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 			)
 		}
 
+		/**
+		 * 输入历史（readline/TUI 惯例）：draft 为空时 ↑ 回填最近一条用户输入，
+		 * 连续 ↑ 翻更早、↓ 翻回更近；用户开始编辑或发送后指针重置。
+		 *
+		 * 状态机：pos ∈ [0, len]（len=历史条数；pos=len 为"基准态"=空 draft/编辑中）。
+		 * 判定不依赖 flag，只比对 draft 与 users[pos]：相等=我们的回填还在，
+		 * 不等=用户编辑/发送/清空 → 重置 pos=len。多条等值历史天然幂等。
+		 *
+		 * 契约：provide 通道 hooks.input（InputState store）+
+		 * props.inputActions.setDraft(text)（官方单写入口，提交阶段自动拒写）；
+		 * 按键走 document 捕获阶段，目标必须位于 [data-composer-card] 内
+		 * （composer textarea），菜单打开时 draft 必含触发词、天然不抢键。
+		 */
+		function installInputHistory(ctx) {
+			let sessionId = undefined
+			let users = []
+			let pos = 0
+			let input = undefined
+			let actions = undefined
+			let unsub = undefined
+			let unsubInfo = undefined
+			let disposed = false
+
+			const textAt = (i) => (i >= 0 && i < users.length ? users[i].text : "")
+
+			/** 会话切换或首次装配：换 face、重置状态、拉取该会话历史。 */
+			const rewire = () => {
+				if (disposed) return
+				const info = ctx.sessions.currentProvideInfo.getSnapshot()
+				const nextId = info && info.sessionId !== undefined ? info.sessionId : undefined
+				if (nextId === sessionId && input !== undefined) return
+				sessionId = nextId
+				pos = 0
+				users = []
+				if (unsub) { unsub(); unsub = undefined }
+				input = info && info.hooks ? info.hooks.input : undefined
+				actions = info && info.props ? info.props.inputActions : undefined
+				if (input && typeof input.subscribe === "function") {
+					unsub = input.subscribe(onInputChange)
+				}
+				if (sessionId !== undefined && sessionId !== "") {
+					sharedFetchUsers(sessionId, false).then((list) => {
+						if (disposed || sessionId !== nextId) return
+						users = list
+						if (pos > users.length) pos = users.length
+					})
+				}
+			}
+
+			/** draft 偏离回填值即重置（用户编辑/发送/清空）；相等则保持（含等值多条）。 */
+			const onInputChange = () => {
+				if (disposed || input === undefined) return
+				const snap = input.getSnapshot()
+				if (snap === undefined) return
+				if (pos < users.length && snap.draft !== textAt(pos)) pos = users.length
+			}
+
+			const onKeyDown = (e) => {
+				if (disposed) return
+				if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return
+				if (e.isComposing || e.keyCode === 229) return
+				if (e.defaultPrevented) return
+				const target = e.target
+				if (!(target instanceof HTMLTextAreaElement)) return
+				if (target.disabled || target.readOnly) return
+				if (target.closest("[data-composer-card]") === null) return
+				rewire()
+				if (input === undefined || actions === undefined) return
+				const snap = input.getSnapshot()
+				if (snap === undefined) return
+				if (snap.phase !== "plain") return
+				const draft = snap.draft
+
+				if (e.key === "ArrowUp") {
+					if (pos >= users.length) {
+						if (draft !== "") return // 基准态且非空：放行光标移动
+						if (users.length === 0) return
+						pos = users.length - 1
+					} else if (draft === textAt(pos)) {
+						if (pos === 0) return
+						pos = pos - 1
+					} else {
+						pos = users.length
+						if (draft !== "") return
+						pos = users.length - 1
+					}
+					e.preventDefault()
+					actions.setDraft(textAt(pos))
+					return
+				}
+				// ArrowDown
+				if (pos >= users.length) return // 基准态：↓ 无历史语义，放行
+				if (draft !== textAt(pos)) { pos = users.length; return }
+				pos = pos + 1
+				e.preventDefault()
+				actions.setDraft(pos === users.length ? "" : textAt(pos))
+			}
+
+			document.addEventListener("keydown", onKeyDown, true)
+			const info = ctx.sessions.currentProvideInfo
+			if (info && typeof info.subscribe === "function") {
+				unsubInfo = info.subscribe(rewire)
+			}
+			rewire()
+			return () => {
+				disposed = true
+				document.removeEventListener("keydown", onKeyDown, true)
+				if (unsub) unsub()
+				if (unsubInfo) unsubInfo()
+			}
+		}
+
 		function apply(ctx) {
 			ctx.effect(() => {
+				const disposeHistory = installInputHistory(ctx)
 				const style = document.createElement("style")
 				style.textContent = CSS_TEXT
 				document.head.appendChild(style)
 				const sessionIdSource = makeSessionIdSource(ctx)
-				return ctx.slots.register({
+				const offSlot = ctx.slots.register({
 					name: "shell.overlay",
 					id: "dsh-node-nav-rail",
 					inject: () => ({ hooks: { sessionId: sessionIdSource } }),
 				}, NodeNavRail)
+				return () => {
+					disposeHistory()
+					offSlot()
+					if (style.isConnected) style.remove()
+				}
 			}, "dsh-node-nav: overlay registration")
 		}
 
