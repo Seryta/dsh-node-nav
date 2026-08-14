@@ -60,6 +60,23 @@ window.__ModuleLoader__.load({
 			return ((bubble ?? row).textContent ?? '').trim()
 		}
 
+		/** 页面自带的「加载更早」按钮（会话历史分页入口）；没有则返回 null。 */
+		function olderButton() {
+			const buttons = document.querySelectorAll('button')
+			for (const b of buttons) {
+				if ((b.textContent ?? '').includes('加载更早')) return b
+			}
+			return null
+		}
+
+		/** 滚动会话流到底部（最新消息）。 */
+		function scrollToBottom() {
+			const scroller = scrollerOf()
+			if (scroller === null) return
+			const reduce = window.matchMedia !== undefined && window.matchMedia("(prefers-reduced-motion: reduce)").matches
+			scroller.scrollTo({ top: scroller.scrollHeight, behavior: reduce ? 'auto' : 'smooth' })
+		}
+
 		/** 平滑跳转 + 短暂高亮；找不到行（已卸载）返回 false。 */
 		function jumpToRow(row) {
 			if (row === null || !row.isConnected) return false
@@ -80,9 +97,17 @@ window.__ModuleLoader__.load({
 .dsh-node-nav-dot:hover { transform: scale(1.4); background: rgba(99,102,241,0.95); border-color: rgba(99,102,241,1); box-shadow: 0 0 0 5px rgba(99,102,241,0.16); }
 .dsh-node-nav-dot:focus-visible { outline: 2px solid rgba(99,102,241,0.9); outline-offset: 2px; }
 .dsh-node-nav-dot-active { background: rgba(99,102,241,0.95); border-color: rgba(99,102,241,1); box-shadow: 0 0 0 4px rgba(99,102,241,0.25); transform: scale(1.2); }
+.dsh-node-nav-bottom { position: relative; flex: none; width: 11px; height: 11px; border-radius: 3px; background: #ffffff; border: 2px solid rgba(127,127,140,0.65); padding: 0; box-sizing: border-box; cursor: pointer; box-shadow: 0 0 0 3px rgba(255,255,255,0.55); margin-top: 10px; transition: transform 0.15s ease, background 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease; }
+.dsh-node-nav-bottom::after { content: ""; position: absolute; left: 50%; top: 50%; width: 4px; height: 4px; margin: -2px 0 0 -2px; border-right: 2px solid rgba(127,127,140,0.9); border-bottom: 2px solid rgba(127,127,140,0.9); transform: rotate(45deg) translate(1px, -1px); }
+.dsh-node-nav-bottom:hover { transform: scale(1.3); background: rgba(99,102,241,0.95); border-color: rgba(99,102,241,1); box-shadow: 0 0 0 5px rgba(99,102,241,0.16); }
+.dsh-node-nav-bottom:hover::after { border-color: #ffffff; }
+.dsh-node-nav-bottom:focus-visible { outline: 2px solid rgba(99,102,241,0.9); outline-offset: 2px; }
 body[data-ds-dark-theme] .dsh-node-nav-dot { background: #1e232b; box-shadow: 0 0 0 3px rgba(0,0,0,0.4); }
 body[data-ds-dark-theme] .dsh-node-nav-dot:hover { background: rgba(129,140,248,0.95); border-color: rgba(165,180,252,1); box-shadow: 0 0 0 5px rgba(129,140,248,0.22); }
 body[data-ds-dark-theme] .dsh-node-nav-dot-active { background: rgba(129,140,248,0.95); border-color: rgba(165,180,252,1); box-shadow: 0 0 0 4px rgba(129,140,248,0.3); }
+body[data-ds-dark-theme] .dsh-node-nav-bottom { background: #1e232b; box-shadow: 0 0 0 3px rgba(0,0,0,0.4); }
+body[data-ds-dark-theme] .dsh-node-nav-bottom:hover { background: rgba(129,140,248,0.95); border-color: rgba(165,180,252,1); box-shadow: 0 0 0 5px rgba(129,140,248,0.22); }
+body[data-ds-dark-theme] .dsh-node-nav-bottom:hover::after { border-color: #ffffff; }
 .dsh-node-nav-preview { position: fixed; z-index: 1001; width: 284px; max-height: 240px; overflow: hidden; background: #ffffff; color: #24292f; border: 1px solid rgba(0,0,0,0.08); border-radius: 12px; padding: 10px 12px; font-size: 13px; line-height: 1.6; text-align: left; box-shadow: 0 10px 32px rgba(0,0,0,0.16), 0 2px 8px rgba(0,0,0,0.08); pointer-events: none; white-space: pre-wrap; word-break: break-word; display: none; animation: dshNavIn 0.16s ease; }
 body[data-ds-dark-theme] .dsh-node-nav-preview { background: #1f242d; color: #e6e9f0; border-color: rgba(255,255,255,0.07); box-shadow: 0 10px 32px rgba(0,0,0,0.55), 0 2px 8px rgba(0,0,0,0.3); }
 @keyframes dshNavIn { from { opacity: 0; transform: translateX(4px); } to { opacity: 1; transform: none; } }
@@ -100,9 +125,14 @@ body[data-ds-dark-theme] .dsh-node-nav-preview { background: #1f242d; color: #e6
 			const [detailsWidth, setDetailsWidth] = react.useState(0)
 			const railRef = react.useRef(null)
 			const previewRef = react.useRef(null)
+			/** 自动预加载历史的上限(连续点击「加载更早」的次数;按钮消失即自然停止)。 */
+			const autoOlderRef = react.useRef(0)
 
 			// DOM 扫描 + MutationObserver（body 全量观察，rAF 去抖）+ 滚动/resize 兜底。
+			// 自动预加载:只要页面还有「加载更早」按钮且未达上限,就代用户点击——
+			// 历史分批进入 DOM 后,导航自然覆盖全部历史(点击前即可见)。
 			react.useEffect(() => {
+				const AUTO_OLDER_MAX = 30
 				let raf = 0
 				const scan = () => {
 					raf = 0
@@ -111,6 +141,13 @@ body[data-ds-dark-theme] .dsh-node-nav-preview { background: #1f242d; color: #e6
 						if (prev.length === rows.length && prev.every((r, i) => r.el === rows[i])) return prev
 						return rows.map((el) => ({ el, preview: rowPreview(el) }))
 					})
+					// 自动加载历史:点击会改 DOM → MutationObserver 再触发 scan →
+					// 若仍有按钮则继续点,直到按钮消失或达到批次上限。
+					const older = olderButton()
+					if (older !== null && autoOlderRef.current < AUTO_OLDER_MAX) {
+						autoOlderRef.current++
+						older.click()
+					}
 				}
 				const schedule = () => {
 					if (raf === 0) raf = requestAnimationFrame(scan)
@@ -181,10 +218,10 @@ body[data-ds-dark-theme] .dsh-node-nav-preview { background: #1f242d; color: #e6
 				return () => document.removeEventListener('scroll', onScroll, { capture: true })
 			}, [roster])
 
-			// hover/focus 预览卡
-			const showPreview = (entry, anchorEl) => {
-				const text = entry.preview
+			// hover/focus 预览卡(通用:给定文本与锚点元素)
+			const showTextPreview = (text, anchorEl) => {
 				if (text === '') return
+				if (anchorEl === null) return
 				const preview = previewRef.current
 				if (preview === null) return
 				preview.textContent = text.length > PREVIEW_CHARS ? text.slice(0, PREVIEW_CHARS) + '…' : text
@@ -207,13 +244,26 @@ body[data-ds-dark-theme] .dsh-node-nav-preview { background: #1f242d; color: #e6
 					key: i,
 					className: "dsh-node-nav-dot" + (isActive ? " dsh-node-nav-dot-active" : ""),
 					"aria-label": `跳转到消息 #${i + 1}`,
-					onMouseEnter: () => { setHoverIdx(i); showPreview(entry, railRef.current ? railRef.current.children[i + 1] : null) },
+					onMouseEnter: () => { setHoverIdx(i); showTextPreview(entry.preview, railRef.current ? railRef.current.children[i + 1] : null) },
 					onMouseLeave: () => { setHoverIdx(-1); hidePreview() },
-					onFocus: () => { setHoverIdx(i); showPreview(entry, railRef.current ? railRef.current.children[i + 1] : null) },
+					onFocus: () => { setHoverIdx(i); showTextPreview(entry.preview, railRef.current ? railRef.current.children[i + 1] : null) },
 					onBlur: () => { setHoverIdx(-1); hidePreview() },
 					onClick: () => { jumpToRow(entry.el) },
 				})
 			})
+
+			// 底部固定节点:跳转到会话流最底端(最新消息),形状与提示区别于消息节点
+			const bottomIdx = roster.length + 1
+			items.push(react.createElement("button", {
+				key: "__bottom",
+				className: "dsh-node-nav-bottom",
+				"aria-label": "跳到底部(最新消息)",
+				onMouseEnter: () => { setHoverIdx(-1); showTextPreview('跳到底部(最新消息)', railRef.current ? railRef.current.children[bottomIdx] : null) },
+				onMouseLeave: hidePreview,
+				onFocus: () => { setHoverIdx(-1); showTextPreview('跳到底部(最新消息)', railRef.current ? railRef.current.children[bottomIdx] : null) },
+				onBlur: hidePreview,
+				onClick: scrollToBottom,
+			}))
 
 			return react.createElement(
 				react.Fragment,
