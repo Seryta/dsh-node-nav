@@ -15,7 +15,7 @@
  *   DOM(上限 30 批),再跳转;hover 预览直接显示服务端全文(含时间);
  * - scroll-spy:active 药丸标出视口内最顶部用户消息(仅对已加载行);
  * - rail 底端固定方形「跳到底部」节点;
- * - details 面板打开时自动左移避让;<2 条消息隐藏;深色模式;
+ * - details 面板打开时自动左移避让;深色模式;
  *   reduced-motion 禁用动画。
  */
 window.__ModuleLoader__.load({
@@ -399,7 +399,7 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 				}
 			}
 
-			const visible = roster.length >= 2 && flowOf() !== null
+			const visible = flowOf() !== null
 
 			// 显示窗口：最多 WINDOW 个节点，窗口随 active 平移（阅读到哪里、
 			// 节点串滑到哪里，无需滚动条）；窗口外两端用渐隐提示。

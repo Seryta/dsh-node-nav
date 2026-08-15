@@ -18,7 +18,7 @@ DSH（DeepSeek Harness）Web GUI 的客户端插件：在聊天区右侧显示�
 | details 避让 | 右侧详情面板打开时节点串自动左移 |
 | 深色模式 | 跟随 `body[data-ds-dark-theme]` |
 | reduced-motion | 系统减少动效偏好下禁用动画 |
-| 自动隐藏 | 少于 2 条用户消息或非对话页时不显示 |
+| 自动隐藏 | 非对话页时不显示 |
 
 ## 截图
 
