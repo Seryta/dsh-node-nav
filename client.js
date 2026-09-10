@@ -227,6 +227,23 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 		}
 
 		/**
+		 * 从 0.1.2+ 的输入机取出可直接调用的 setDraft。
+		 *
+		 * `conversation.input.for(scope)` 返回的是 SessionInputShell 实例，其
+		 * `setDraft` 是原型方法（内部读 `this.projection.clipboardText`）。把这个
+		 * 方法引用摘下来单独调用会丢 `this`，直接抛 `TypeError: Cannot read
+		 * properties of undefined (reading 'clipboardText')`，表现为 ↑/↓ 历史回填
+		 * 静默失效（dsh-client-ui-conversation 0.1.5 实测，2026-09-10）。
+		 * 故优先用 shell 的公开 action face（`actions.setDraft`，箭头函数、自带词法
+		 * this），取不到再把原型方法绑回实例。
+		 */
+		function inputSetDraft(input) {
+			const face = input.actions !== undefined && typeof input.actions.setDraft === "function" ? input.actions : input
+			if (typeof face.setDraft !== "function") return undefined
+			return face.setDraft.bind(face)
+		}
+
+		/**
 		 * 当前会话的输入机，双代兼容：
 		 *  - 0.1.2：ctx.conversation.input.for(会话 scope).state + .setDraft
 		 *  - 0.1.1：currentProvideInfo 的 hooks.input + props.inputActions.setDraft
@@ -241,7 +258,7 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 			if (conversation !== undefined && conversation.input && typeof conversation.input.for === "function") {
 				try {
 					const input = conversation.input.for(actx)
-					if (input !== undefined) return { state: input.state, setDraft: input.setDraft }
+					if (input !== undefined) return { state: input.state, setDraft: inputSetDraft(input) }
 				} catch { /* 落到 0.1.1 回退 */ }
 			}
 			const info = ctx.sessions && ctx.sessions.currentProvideInfo

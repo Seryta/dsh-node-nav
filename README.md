@@ -89,7 +89,8 @@ DSH 0.1.5 起官方 `dsh-client-ui-chat` 自带 TurnNavigator 轨（整会话轮
 
 ## 已知限制
 
-- 输入历史与跳转依赖 dsh 客户端契约：`[data-chat-anchor-key]`（行锚点）、`[data-composer-card]`（composer 容器）与 provide 通道 `hooks.input` / `props.inputActions`（输入状态与写入口）；harness 大版本改动这些契约时需同步适配。
+- 输入历史与跳转依赖 dsh 客户端契约：`[data-chat-anchor-key]`（行锚点）、`[data-composer-card]`（composer 容器）与输入状态/写入口——0.1.2+ 走 `ctx.conversation.input.for(scope)` 的 `state` + `setDraft`，0.1.1 走 provide 通道 `hooks.input` / `props.inputActions`。harness 大版本改动这些契约时需同步适配。
+- `setDraft` 必须绑回实例调用：0.1.2+ 的 `input.for()` 返回 SessionInputShell 实例，其 `setDraft` 是原型方法（内部读 `this.projection.clipboardText`），摘下来单独调用会丢 `this` 并抛 `TypeError`，表现为 ↑/↓ 回填静默失效。插件统一经 `inputSetDraft()` 取绑定后的函数。
 - 输入历史仅覆盖**当前打开的（live）会话**：host 端点只查 attached 会话，未打开的历史会话无 composer 焦点，不适用输入历史。
 - 未加载节点点击依赖页面「加载更早」按钮存在（上限 30 批）；按钮被移除的 harness 版本中，点击未加载节点会提示目标消息未能定位。
 
