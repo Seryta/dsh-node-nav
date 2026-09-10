@@ -85,7 +85,13 @@ DSH 0.1.5 起官方 `dsh-client-ui-chat` 自带 TurnNavigator 轨（整会话轮
 
 官方轨的不足（当时评估）：容器宽度 ≤900px 时整轨隐藏；轨高上限 420px，长会话需在轨内滚动；预览只 1 行提问 + 3 行回答；无「跳到底部」节点；无输入历史 ↑/↓。
 
-隐藏方式：官方类名带构建哈希（如 `eGxaPq_frame` / `eGxaPq_slot`），不能硬编码。插件按结构探测官方轨（绝对定位、宽 ≤40、高 ≥40、内部含 ≥2 个 `_mark` 的 nav），取到其 slot 祖先的类名后注入 `<style>{类名}{display:none!important}</style>`；同一构建内类名稳定，首次命中即断开 MutationObserver，不为流式 delta 反复重扫 DOM。要切回官方轨，删掉 `client.js` 里的 `installOfficialRailOverride` 调用即可。
+隐藏方式：官方类名带构建哈希（如 `eGxaPq_frame`），不能硬编码，故运行时探测后生成规则。三层保险：
+
+1. **类名规则** —— 探测按 `nav` 标签 + 类名含 `_frame` + 内部 ≥2 个 `_mark` 匹配，**刻意不看元素可见性**：`display:none` 的元素 rect 恒为 0，用几何判据在「官方轨已被上一份规则隐藏」时必然探空，客户端 HMR 换代空档就会漏掉（这正是首版失效的原因）。同一文档里 `pI_x6G_frame`（DIV，聊天滚动画布）也含 `_frame`，故用 `nav` 标签排除。类名规则对 React 重建出的新节点同样生效。
+2. **内联 `display:none`** —— 规则之外再压一层，样式元素被摘掉也仍然隐藏；`dispose` 时还原。
+3. **常驻 MutationObserver** —— 同时盯 `body`（等官方轨出现）与 `head`（样式元素被摘掉不会产生 body 变更）；守卫是纯属性读取，不做 DOM 遍历，流式 delta 期间开销可忽略。
+
+实测（含真实 HMR 热重载两次 + 摘除覆盖后自愈）见 `tmp/dsh-node-nav-restore/verify-hmr-heal.js`。要切回官方轨，删掉 `client.js` 里的 `installOfficialRailOverride` 调用即可。
 
 ## 已知限制
 

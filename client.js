@@ -213,17 +213,25 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 		 * 当前会话 id，双代兼容：
 		 *  - 0.1.2：ctx.sessions.list.getSnapshot().current
 		 *  - 0.1.1：ctx.sessions.currentProvideInfo.getSnapshot().sessionId
+		 * 读不到一律返回 undefined（调用方按"未知"处理）。上下文已失效时也走这条路：
+		 * 客户端 HMR 换代时 store 订阅回调可能早于 dispose 跑，此时 ctx 已 inactive，
+		 * 访问 ctx.sessions 会抛 "cannot get required service in inactive context"，
+		 * 被 store 记为 subscriber failed 刷进控制台（实测每个热重载一条）。
 		 */
 		function currentSessionId(ctx) {
-			const list = ctx.sessions && ctx.sessions.list
-			const snap = list && typeof list.getSnapshot === "function" ? list.getSnapshot() : undefined
-			if (snap && typeof snap.current === "string" && snap.current !== "") return snap.current
-			const info = ctx.sessions && ctx.sessions.currentProvideInfo
-			if (info && typeof info.getSnapshot === "function") {
-				const s2 = info.getSnapshot()
-				return s2 && typeof s2.sessionId === "string" ? s2.sessionId : undefined
+			try {
+				const list = ctx.sessions && ctx.sessions.list
+				const snap = list && typeof list.getSnapshot === "function" ? list.getSnapshot() : undefined
+				if (snap && typeof snap.current === "string" && snap.current !== "") return snap.current
+				const info = ctx.sessions && ctx.sessions.currentProvideInfo
+				if (info && typeof info.getSnapshot === "function") {
+					const s2 = info.getSnapshot()
+					return s2 && typeof s2.sessionId === "string" ? s2.sessionId : undefined
+				}
+				return undefined
+			} catch {
+				return undefined
 			}
-			return undefined
 		}
 
 		/**
@@ -660,20 +668,23 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 		}
 
 		/**
-		 * 官方 TurnNavigator 轨的结构探测：绝对定位、宽 ≤40、高 ≥40、内部 ≥2 个
-		 * `_mark` 的 nav，返回它的 slot 祖先。
+		 * 官方 TurnNavigator 轨的 DOM 节点，**隐藏状态下也认得出**。
+		 *
+		 * 按「nav 标签 + 类名含 `_frame` + 内部 ≥2 个 `_mark`」匹配，刻意不看可见性：
+		 * display:none 的元素 rect 恒为 0，几何判据在「官方轨已被上一份规则隐藏」时
+		 * 必然探空 —— 客户端 HMR 重新 apply 时旧实例的样式可能尚未摘除，新实例探空后
+		 * 旧样式才被摘掉，官方轨就此复活（2026-09-10 用户实测：刷新后正常、长驻页面
+		 * 不行）。`_frame` 后缀来自官方源码的 CSS-module 类名，跨构建稳定；同一文档里
+		 * `pI_x6G_frame`（DIV，聊天滚动画布）也含 `_frame`，故用 nav 标签排除。
 		 */
-		function officialRailSlot() {
-			for (const mark of document.querySelectorAll('[class*="_mark"]')) {
-				let el = mark
-				for (let i = 0; i < 4 && el !== null && el !== document.body; i += 1) {
-					const rect = el.getBoundingClientRect()
-					const narrow = rect.width > 0 && rect.width <= 40 && rect.height >= 40
-					if (narrow && getComputedStyle(el).position === "absolute" && el.querySelectorAll('[class*="_mark"]').length >= 2) {
-						return el.parentElement === null ? el : el.parentElement
-					}
-					el = el.parentElement
-				}
+		function officialRail() {
+			for (const el of document.querySelectorAll('nav[class*="_frame"]')) {
+				if (el.querySelectorAll('[class*="_mark"]').length >= 2) return el
+			}
+			// 回退：官方若不再用 nav 标签，退回几何判据（只在新加载场景可用）。
+			for (const el of document.querySelectorAll('[class*="_frame"]')) {
+				const rect = el.getBoundingClientRect()
+				if (rect.width > 0 && rect.width <= 40 && rect.height >= 40 && el.querySelectorAll('[class*="_mark"]').length >= 2) return el
 			}
 			return undefined
 		}
@@ -684,32 +695,47 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 		 * 官方轨与本插件节点串同处右缘：实测 1700px 视口下官方轨 1650–1678、
 		 * 本轨 1656–1672，横向重叠 16px、纵向 152px —— 两条轨叠在一起。故隐藏官方轨。
 		 *
-		 * 官方类名带构建哈希（eGxaPq_slot / eGxaPq_frame）不能硬编码：运行时按结构
-		 * 探测拿类名，再生成 !important 规则。同一构建内类名稳定，首次命中后规则
-		 * 永久生效、观察器随即断开（流式 delta 期间不为每次 DOM 变更重扫）。
+		 * 官方类名带构建哈希（eGxaPq_frame）不能硬编码：运行时探测拿类名再生成规则。
+		 * 三层保险，任一层单独失效都不会让官方轨复活：
+		 *   ① 类名规则 —— 覆盖 React 重建出来的新节点；
+		 *   ② 内联 display:none —— 类名若随官方构建变化，规则失效时仍压得住；
+		 *   ③ 常驻观察器 —— 规则被摘掉（客户端 HMR 换代空档）或样式元素脱离文档时补回。
+		 * 观察器守卫是纯属性读取（不做 DOM 遍历），流式 delta 期间开销可忽略。
 		 */
 		function installOfficialRailOverride() {
 			const style = document.createElement("style")
 			document.head.appendChild(style)
 			let scheduled = false
+			/** 已隐藏的官方轨节点，用于廉价守卫与 dispose 时还原。 */
+			let hidden = undefined
 			const observer = new MutationObserver(() => {
+				if (style.isConnected && style.textContent !== "" && hidden !== undefined && hidden.isConnected && hidden.style.display === "none") return
 				if (scheduled) return
 				scheduled = true
 				setTimeout(hideOfficial, 300)
 			})
 			function hideOfficial() {
 				scheduled = false
-				const slot = officialRailSlot()
-				if (slot === undefined) return
-				const cls = String(slot.className || "").split(/\s+/).filter((c) => c !== "")[0]
-				if (cls === undefined) return
-				style.textContent = `.${cls}{display:none !important}`
-				observer.disconnect()
+				const rail = officialRail()
+				if (rail === undefined) return
+				const cls = String(rail.className || "").split(/\s+/).filter((c) => c.includes("_frame"))[0]
+				if (cls !== undefined) {
+					const rule = `.${cls}{display:none !important}`
+					if (style.textContent !== rule) style.textContent = rule
+				}
+				// 脱离文档的 <style> 不生效：被摘掉就挂回去。
+				if (!style.isConnected) document.head.appendChild(style)
+				rail.style.display = "none"
+				hidden = rail
 			}
 			hideOfficial()
-			if (style.textContent === "") observer.observe(document.body, { childList: true, subtree: true })
+			observer.observe(document.body, { childList: true, subtree: true })
+			// 覆盖样式本身被摘掉（HMR 换代 / 样式清理）不会产生 body 变更 —— 单看
+			// body 会漏掉这种情况，故同时盯 head。
+			observer.observe(document.head, { childList: true })
 			return () => {
 				observer.disconnect()
+				if (hidden !== undefined && hidden.isConnected) hidden.style.display = ""
 				if (style.isConnected) style.remove()
 			}
 		}
