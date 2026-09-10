@@ -209,20 +209,71 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 			return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`
 		}
 
-		/** 会话 id 的 bare observable(订阅 currentProvideInfo)。 */
+		/**
+		 * 当前会话 id，双代兼容：
+		 *  - 0.1.2：ctx.sessions.list.getSnapshot().current
+		 *  - 0.1.1：ctx.sessions.currentProvideInfo.getSnapshot().sessionId
+		 */
+		function currentSessionId(ctx) {
+			const list = ctx.sessions && ctx.sessions.list
+			const snap = list && typeof list.getSnapshot === "function" ? list.getSnapshot() : undefined
+			if (snap && typeof snap.current === "string" && snap.current !== "") return snap.current
+			const info = ctx.sessions && ctx.sessions.currentProvideInfo
+			if (info && typeof info.getSnapshot === "function") {
+				const s2 = info.getSnapshot()
+				return s2 && typeof s2.sessionId === "string" ? s2.sessionId : undefined
+			}
+			return undefined
+		}
+
+		/**
+		 * 当前会话的输入机，双代兼容：
+		 *  - 0.1.2：ctx.conversation.input.for(会话 scope).state + .setDraft
+		 *  - 0.1.1：currentProvideInfo 的 hooks.input + props.inputActions.setDraft
+		 */
+		function currentInput(ctx) {
+			const sid = currentSessionId(ctx)
+			if (sid === undefined) return undefined
+			let actx
+			try { actx = ctx.sessions.scope(sid) } catch { return undefined }
+			if (actx === undefined) return undefined
+			const conversation = ctx.get ? ctx.get("conversation") : undefined
+			if (conversation !== undefined && conversation.input && typeof conversation.input.for === "function") {
+				try {
+					const input = conversation.input.for(actx)
+					if (input !== undefined) return { state: input.state, setDraft: input.setDraft }
+				} catch { /* 落到 0.1.1 回退 */ }
+			}
+			const info = ctx.sessions && ctx.sessions.currentProvideInfo
+			if (info && typeof info.getSnapshot === "function") {
+				const snap = info.getSnapshot()
+				if (snap === undefined) return undefined
+				const store = snap.hooks && snap.hooks.input
+				const actions = snap.props && snap.props.inputActions
+				if (store !== undefined) return { state: store, setDraft: actions && actions.setDraft }
+			}
+			return undefined
+		}
+
+		/** 会话 id 的 bare observable（0.1.2 订阅 sessions.list，0.1.1 回退 currentProvideInfo）。 */
 		function makeSessionIdSource(ctx) {
 			const listeners = new Set()
 			let snapshot = undefined
 			let disposed = false
 			const recompute = () => {
 				if (disposed) return
-				const info = ctx.sessions.currentProvideInfo.getSnapshot()
-				const next = info ? info.sessionId : undefined
+				const next = currentSessionId(ctx)
 				if (snapshot === next) return
 				snapshot = next
 				for (const fn of listeners) fn()
 			}
-			const unsub = ctx.sessions.currentProvideInfo.subscribe(recompute)
+			let unsub = undefined
+			const list = ctx.sessions && ctx.sessions.list
+			if (list && typeof list.subscribe === "function") unsub = list.subscribe(recompute)
+			else {
+				const info = ctx.sessions && ctx.sessions.currentProvideInfo
+				if (info && typeof info.subscribe === "function") unsub = info.subscribe(recompute)
+			}
 			recompute()
 			return {
 				getSnapshot: () => snapshot,
@@ -232,7 +283,7 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 				},
 				dispose: () => {
 					disposed = true
-					unsub()
+					if (unsub) unsub()
 					listeners.clear()
 				},
 			}
@@ -498,9 +549,9 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 			/** 会话切换或首次装配：换 face、重置状态、拉取该会话历史。 */
 			const rewire = () => {
 				if (disposed) return
-				const info = ctx.sessions.currentProvideInfo.getSnapshot()
-				const nextId = info && info.sessionId !== undefined ? info.sessionId : undefined
-				const nextInput = info && info.hooks ? info.hooks.input : undefined
+				const inp = currentInput(ctx)
+				const nextId = currentSessionId(ctx)
+				const nextInput = inp && inp.state && typeof inp.state.getSnapshot === "function" ? inp.state : undefined
 				// 身份守卫：sessionId 相同且 input store 身份未变才视为已装配；
 				// HMR 重载后 provide bundle 重建、input store 换身份，必须重新订阅。
 				if (nextId === sessionId && input !== undefined && input === nextInput) return
@@ -509,7 +560,7 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 				users = []
 				if (unsub) { unsub(); unsub = undefined }
 				input = nextInput
-				actions = info && info.props ? info.props.inputActions : undefined
+				actions = inp && typeof inp.setDraft === "function" ? { setDraft: inp.setDraft } : undefined
 				if (input && typeof input.subscribe === "function") {
 					unsub = input.subscribe(onInputChange)
 				}
@@ -536,7 +587,7 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 				if (e.isComposing || e.keyCode === 229) return
 				if (e.defaultPrevented) return
 				const target = e.target
-				if (!(target instanceof HTMLTextAreaElement)) return
+				if (!(target instanceof HTMLTextAreaElement) && !(target && target.isContentEditable === true)) return
 				if (target.disabled || target.readOnly) return
 				if (target.closest("[data-composer-card]") === null) return
 				rewire()
@@ -572,9 +623,15 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 			}
 
 			document.addEventListener("keydown", onKeyDown, true)
-			const info = ctx.sessions.currentProvideInfo
-			if (info && typeof info.subscribe === "function") {
-				unsubInfo = info.subscribe(rewire)
+			// 会话切换订阅：0.1.2 用 sessions.list，0.1.1 回退 currentProvideInfo。
+			const list = ctx.sessions && ctx.sessions.list
+			if (list && typeof list.subscribe === "function") {
+				unsubInfo = list.subscribe(rewire)
+			} else {
+				const info = ctx.sessions && ctx.sessions.currentProvideInfo
+				if (info && typeof info.subscribe === "function") {
+					unsubInfo = info.subscribe(rewire)
+				}
 			}
 			rewire()
 			return () => {
@@ -606,7 +663,7 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 		}
 
 		exports.apply = apply;
-		exports.inject = ["sessions", "slots"];
+		exports.inject = ["sessions", "conversation", "slots"];
 		return module.exports;
 	}
 });

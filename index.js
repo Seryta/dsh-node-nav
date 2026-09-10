@@ -42,8 +42,12 @@ export function apply(ctx) {
       res.end(JSON.stringify({ users: [] }))
       return
     }
+    // 0.1.2-alpha.4 起 `Session.events` 被移除，改读 `snapshotEvents()`
+    // （冻结快照，下次 append 前复用）；保留旧属性回退以兼容更早运行时。
+    // 与 mode-boost 的 eventsOf() 用同一种兼容写法。
+    const events = typeof session.snapshotEvents === 'function' ? session.snapshotEvents() : session.events
     const users = []
-    for (const event of session.events) {
+    for (const event of events ?? []) {
       if (event.type !== 'user/message') continue
       const data = event.data
       const messages = Array.isArray(data) ? data : [data]
