@@ -8,6 +8,7 @@ DSH（DeepSeek Harness）Web GUI 的客户端插件：在聊天区右侧显示�
 
 | 功能 | 说明 |
 |---|---|
+| 覆盖官方轨 | 隐藏官方 `dsh-client-ui-chat` 的 TurnNavigator 轨（两条轨同处右缘、几何重叠），由本插件接管轮次导航 |
 | 节点串 | 右缘纵向节点串，每条用户消息一个圆点；最多同时显示 15 个，窗口随阅读位置滑动（无滚动条），两端渐隐提示更多 |
 | 全量历史节点 | host 半部从会话日志提取全部用户消息（含分页未加载的历史），导航在点击前就覆盖全部历史，页面保持原生分页不展开 |
 | 底部节点 | rail 最底端固定一个方形「跳到底部（最新消息）」节点，形状与提示区别于消息节点 |
@@ -77,6 +78,14 @@ dsh plugin --profile web add ./dsh-node-nav
 |---|---|---|
 | [dsh-navbar](https://github.com/vlln/dsh-navbar) | DOM 扫描（同款思路） | 本插件采用相同的 DOM 扫描契约，但保留 React + `shell.overlay` 槽位形态（可停用/启用），并补充 details 面板避让 |
 | [dsh-turn-index](https://github.com/Simon314620/dsh-turn-index) | 会话快照 `binding(id).session` | 快照方案在部分 dsh 版本上只见最近窗口节点，故本插件改走 DOM |
+
+## 覆盖官方轨
+
+DSH 0.1.5 起官方 `dsh-client-ui-chat` 自带 TurnNavigator 轨（整会话轮次导航）。它与本插件同处聊天区右缘，实测 1700px 视口下官方轨横跨 1650–1678、本插件 1656–1672 —— **横向重叠 16px、纵向 152px**，两条轨会叠在一起。评估后（2026-09-10）由本插件接管轮次导航，插件启动时隐藏官方轨。
+
+官方轨的不足（当时评估）：容器宽度 ≤900px 时整轨隐藏；轨高上限 420px，长会话需在轨内滚动；预览只 1 行提问 + 3 行回答；无「跳到底部」节点；无输入历史 ↑/↓。
+
+隐藏方式：官方类名带构建哈希（如 `eGxaPq_frame` / `eGxaPq_slot`），不能硬编码。插件按结构探测官方轨（绝对定位、宽 ≤40、高 ≥40、内部含 ≥2 个 `_mark` 的 nav），取到其 slot 祖先的类名后注入 `<style>{类名}{display:none!important}</style>`；同一构建内类名稳定，首次命中即断开 MutationObserver，不为流式 delta 反复重扫 DOM。要切回官方轨，删掉 `client.js` 里的 `installOfficialRailOverride` 调用即可。
 
 ## 已知限制
 

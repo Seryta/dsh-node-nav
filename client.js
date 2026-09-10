@@ -642,9 +642,65 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 			}
 		}
 
+		/**
+		 * 官方 TurnNavigator 轨的结构探测：绝对定位、宽 ≤40、高 ≥40、内部 ≥2 个
+		 * `_mark` 的 nav，返回它的 slot 祖先。
+		 */
+		function officialRailSlot() {
+			for (const mark of document.querySelectorAll('[class*="_mark"]')) {
+				let el = mark
+				for (let i = 0; i < 4 && el !== null && el !== document.body; i += 1) {
+					const rect = el.getBoundingClientRect()
+					const narrow = rect.width > 0 && rect.width <= 40 && rect.height >= 40
+					if (narrow && getComputedStyle(el).position === "absolute" && el.querySelectorAll('[class*="_mark"]').length >= 2) {
+						return el.parentElement === null ? el : el.parentElement
+					}
+					el = el.parentElement
+				}
+			}
+			return undefined
+		}
+
+		/**
+		 * 覆盖官方 TurnNavigator 轨（2026-09-10 用户裁定：由本插件接管轮次导航）。
+		 *
+		 * 官方轨与本插件节点串同处右缘：实测 1700px 视口下官方轨 1650–1678、
+		 * 本轨 1656–1672，横向重叠 16px、纵向 152px —— 两条轨叠在一起。故隐藏官方轨。
+		 *
+		 * 官方类名带构建哈希（eGxaPq_slot / eGxaPq_frame）不能硬编码：运行时按结构
+		 * 探测拿类名，再生成 !important 规则。同一构建内类名稳定，首次命中后规则
+		 * 永久生效、观察器随即断开（流式 delta 期间不为每次 DOM 变更重扫）。
+		 */
+		function installOfficialRailOverride() {
+			const style = document.createElement("style")
+			document.head.appendChild(style)
+			let scheduled = false
+			const observer = new MutationObserver(() => {
+				if (scheduled) return
+				scheduled = true
+				setTimeout(hideOfficial, 300)
+			})
+			function hideOfficial() {
+				scheduled = false
+				const slot = officialRailSlot()
+				if (slot === undefined) return
+				const cls = String(slot.className || "").split(/\s+/).filter((c) => c !== "")[0]
+				if (cls === undefined) return
+				style.textContent = `.${cls}{display:none !important}`
+				observer.disconnect()
+			}
+			hideOfficial()
+			if (style.textContent === "") observer.observe(document.body, { childList: true, subtree: true })
+			return () => {
+				observer.disconnect()
+				if (style.isConnected) style.remove()
+			}
+		}
+
 		function apply(ctx) {
 			ctx.effect(() => {
 				const disposeHistory = installInputHistory(ctx)
+				const disposeOfficialRail = installOfficialRailOverride()
 				const style = document.createElement("style")
 				style.textContent = CSS_TEXT
 				document.head.appendChild(style)
@@ -656,6 +712,7 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 				}, NodeNavRail)
 				return () => {
 					disposeHistory()
+					disposeOfficialRail()
 					offSlot()
 					if (style.isConnected) style.remove()
 				}
