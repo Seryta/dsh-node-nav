@@ -35,6 +35,16 @@ window.__ModuleLoader__.load({
 		/** 在途请求：sessionId → promise（去重：导航/历史/重拉并发时只发一次请求）。 */
 		var inflightUsers = new Map()
 		/**
+		 * 缓存更新订阅：rail 每次防抖重拉都会刷新 usersCache，历史模块据此把
+		 * 「页面挂载之后才到达的用户消息」也纳入 ↑/↓。旧实现只在 rewire 时读一次
+		 * 列表，页面生命周期内新发的消息永远进不了历史（2026-11-04 用户实测）。
+		 */
+		var usersListeners = new Set()
+		function onUsersUpdated(fn) {
+			usersListeners.add(fn)
+			return () => { usersListeners.delete(fn) }
+		}
+		/**
 		 * force=false 命中缓存立即返回；force=true 强制重拉（DOM 变化后的
 		 * 防抖刷新）。并发去重：同会话在途请求共享一个 promise（数据是最
 		 * 近 800ms 内的，足够新）。不做 [图片] 过滤——导航节点串保留全部
@@ -56,9 +66,12 @@ window.__ModuleLoader__.load({
 					if (!data || !Array.isArray(data.users)) return []
 					const users = data.users
 						.filter((u) => u && typeof u.text === "string" && u.text !== "")
-						.map((u) => ({ id: u.id, time: u.time, text: u.text }))
+						.map((u) => ({ id: u.id, seq: u.seq, time: u.time, text: u.text }))
 					if (usersCache.size >= USERS_CACHE_MAX) usersCache.delete(usersCache.keys().next().value)
 					usersCache.set(sessionId, users)
+					for (const fn of usersListeners) {
+						try { fn(sessionId, users) } catch { /* 订阅方异常不影响请求链 */ }
+					}
 					return users
 				})
 				.catch(() => {
@@ -72,6 +85,92 @@ window.__ModuleLoader__.load({
 			return promise
 		}
 
+
+		/* ── 旁支问答（dsh-btw）桥接 ──────────────────────────────────────
+		 * 旁支记录不是用户消息，不在 /api/users 里。dsh-btw 的 client 半部把只读快照
+		 * 挂到 window.__dshBtw（list/selected/open/subscribe），这里按 anchorSeq 把它们
+		 * 混进节点串：菱形=旁支，点击回开浮条，hover 显示提问。
+		 * btw 没装 = 没有这个对象 = 行为与从前完全一致。 */
+		const EMPTY_BTW = Object.freeze([])
+
+		function btwBridge() {
+			const api = typeof window === "undefined" ? undefined : window.__dshBtw
+			return api && typeof api.list === "function" && typeof api.subscribe === "function" ? api : undefined
+		}
+
+		/**
+		 * 订阅旁支快照与“浮条里当前那条”；桥缺席时恒为空。
+		 * 每次同步都重新读 window.__dshBtw：btw 单独热重载会换掉那个对象，
+		 * 抓住旧引用会拿到已死的闭包。1s 轮询只用于发现“对象被换掉”，不拉数据。
+		 */
+		function useBtwState() {
+			const [state, setState] = react.useState(() => ({
+				items: EMPTY_BTW,
+				selectedId: undefined,
+			}))
+			react.useEffect(() => {
+				const read = () => {
+					const live = btwBridge()
+					if (live === undefined) return { items: EMPTY_BTW, selectedId: undefined }
+					return {
+						items: live.list(),
+						selectedId: typeof live.selected === "function" ? live.selected() : undefined,
+					}
+				}
+				const sync = () => setState(read())
+				let api = btwBridge()
+				let off = api === undefined ? undefined : api.subscribe(sync)
+				sync()
+				const timer = window.setInterval(() => {
+					const current = btwBridge()
+					if (current === api) return
+					if (off !== undefined) off()
+					api = current
+					off = api === undefined ? undefined : api.subscribe(sync)
+					sync()
+				}, 1000)
+				return () => {
+					window.clearInterval(timer)
+					if (off !== undefined) off()
+				}
+			}, [])
+			return state
+		}
+
+		/**
+		 * 把旁支按 anchorSeq 插进用户消息节点串：anchorSeq 是该记录在会话日志里的
+		 * 位置，比它早的用户消息（seq 更小或相等）排在前面，于是“第几次提问之后”
+		 * 的先后关系与日志完全一致。纯 DOM 回退模式没有 seq，退化为追加在末尾。
+		 */
+		function mergeBtwMarkers(roster, items) {
+			if (!Array.isArray(items) || items.length === 0) return roster
+			const marks = []
+			for (const item of items) {
+				if (item === null || typeof item !== "object" || typeof item.btwId !== "string") continue
+				marks.push({
+					kind: "btw",
+					btwId: item.btwId,
+					seq: typeof item.anchorSeq === "number" ? item.anchorSeq : undefined,
+					time: item.startedAt,
+					preview: item.question,
+					status: item.status,
+				})
+			}
+			if (marks.length === 0) return roster
+			const order = (value) => (typeof value === "number" ? value : Number.MAX_SAFE_INTEGER)
+			marks.sort((a, b) => order(a.seq) - order(b.seq))
+			const hasSeq = roster.some((entry) => typeof entry.seq === "number")
+			// 端点回退（纯 DOM 扫描）时没有 seq 可比：至少保证旁支自身按日志顺序排好。
+			if (!hasSeq) return roster.concat(marks)
+			const merged = []
+			let cursor = 0
+			for (const mark of marks) {
+				while (cursor < roster.length && typeof roster[cursor].seq === "number" && roster[cursor].seq <= order(mark.seq)) merged.push(roster[cursor++])
+				merged.push(mark)
+			}
+			while (cursor < roster.length) merged.push(roster[cursor++])
+			return merged
+		}
 		/** 对话流容器动态查询(会话切换后容器可能被替换)。 */
 		function flowOf() {
 			return document.querySelector('[data-chat-flow=""]')
@@ -162,6 +261,7 @@ window.__ModuleLoader__.load({
 			})
 		}
 
+
 		const CSS_TEXT = `
 .dsh-node-nav-rail { position: fixed; right: 28px; top: 50%; transform: translateY(-50%); width: 16px; max-height: calc(100vh - 32px); overflow-y: auto; scrollbar-width: none; z-index: 1000; display: flex; flex-direction: column; align-items: center; gap: 9px; padding: 14px 0; }
 .dsh-node-nav-rail::-webkit-scrollbar { display: none; }
@@ -200,6 +300,15 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 @media (prefers-reduced-motion: reduce) {
   .dsh-node-nav-dot, .dsh-node-nav-preview, .dsh-node-nav-bottom, .dsh-node-nav-miss { transition: none; animation: none; }
 }
+/* 旁支问答节点：菱形。用户消息是圆点、底部跳转是方块，三种形状一眼可分。
+   旋转必须写进每个状态，否则 hover/active 会把它转回方块。 */
+.dsh-node-nav-btw { border-radius: 2px; border-color: rgba(20, 184, 166, 0.65); transform: rotate(45deg) scale(0.92); }
+.dsh-node-nav-btw:hover { transform: rotate(45deg) scale(1.3); background: rgba(20, 184, 166, 0.95); border-color: rgba(20, 184, 166, 1); box-shadow: 0 0 0 5px rgba(20, 184, 166, 0.16); }
+.dsh-node-nav-btw:focus-visible { outline: 2px solid rgba(20, 184, 166, 0.9); outline-offset: 2px; }
+.dsh-node-nav-btw.dsh-node-nav-dot-active { transform: rotate(45deg) scale(1.12); background: rgba(20, 184, 166, 0.95); border-color: rgba(20, 184, 166, 1); box-shadow: 0 0 0 4px rgba(20, 184, 166, 0.25); }
+body[data-ds-dark-theme] .dsh-node-nav-btw { border-color: rgba(45, 212, 191, 0.7); }
+body[data-ds-dark-theme] .dsh-node-nav-btw:hover { background: rgba(45, 212, 191, 0.95); border-color: rgba(153, 246, 228, 1); box-shadow: 0 0 0 5px rgba(45, 212, 191, 0.22); }
+body[data-ds-dark-theme] .dsh-node-nav-btw.dsh-node-nav-dot-active { background: rgba(45, 212, 191, 0.95); border-color: rgba(153, 246, 228, 1); box-shadow: 0 0 0 4px rgba(45, 212, 191, 0.3); }
 `
 
 		/** epoch ms → HH:MM。 */
@@ -210,8 +319,10 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 		}
 
 		/**
-		 * 当前会话 id，双代兼容：
-		 *  - 0.1.2：ctx.sessions.list.getSnapshot().current
+		 * 当前会话 id，三代兼容：
+		 *  - 0.1.5-rc.1：ctx.sessions.list.getSnapshot().current
+		 *  - 0.1.6-alpha.2：current/currentAddress 已被删除，"当前会话"改由视图层
+		 *    以 mainView 占用表达（SessionSummary.retainedBy.mainView > 0）
 		 *  - 0.1.1：ctx.sessions.currentProvideInfo.getSnapshot().sessionId
 		 * 读不到一律返回 undefined（调用方按"未知"处理）。上下文已失效时也走这条路：
 		 * 客户端 HMR 换代时 store 订阅回调可能早于 dispose 跑，此时 ctx 已 inactive，
@@ -223,6 +334,14 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 				const list = ctx.sessions && ctx.sessions.list
 				const snap = list && typeof list.getSnapshot === "function" ? list.getSnapshot() : undefined
 				if (snap && typeof snap.current === "string" && snap.current !== "") return snap.current
+				// 0.1.6-alpha.2：list 状态不再带 current/currentAddress，改为按
+				// retainedBy.mainView 占用计数反推（同一时刻只应有一个 mainView 持有者）。
+				if (snap && snap.byId !== null && typeof snap.byId === "object") {
+					for (const id of Object.keys(snap.byId)) {
+						const retainedBy = snap.byId[id] && snap.byId[id].retainedBy
+						if (retainedBy && typeof retainedBy.mainView === "number" && retainedBy.mainView > 0) return id
+					}
+				}
 				const info = ctx.sessions && ctx.sessions.currentProvideInfo
 				if (info && typeof info.getSnapshot === "function") {
 					const s2 = info.getSnapshot()
@@ -327,6 +446,7 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 			const railRef = react.useRef(null)
 			const previewRef = react.useRef(null)
 			const missTimer = react.useRef(0)
+			const btwState = useBtwState()
 
 			// 服务端全量列表:会话切换或 DOM 变化(新消息/加载历史)时防抖刷新
 			react.useEffect(() => {
@@ -425,6 +545,7 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 			if (remoteUsers.length > 0) {
 				roster = remoteUsers.map((u) => ({
 					id: u.id,
+					seq: u.seq,
 					time: u.time,
 					preview: u.text,
 					el: anchorOfId(u.id),
@@ -432,6 +553,8 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 			} else {
 				roster = userRows().map((el) => ({ id: undefined, time: undefined, preview: rowPreview(el), el }))
 			}
+			// 旁支记录按 anchorSeq 混进来：菱形节点与用户消息节点共用同一串、同一顺序。
+			roster = mergeBtwMarkers(roster, btwState.items)
 			// activeIdx 即 roster 全局索引（scroll-spy 已与节点串同源，无需映射）。
 
 			const showTextPreview = (text, time, anchorEl) => {
@@ -464,7 +587,6 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 				window.clearTimeout(missTimer.current)
 				missTimer.current = window.setTimeout(() => setMiss(""), 3000)
 			}
-
 			const onNodeClick = async (entry) => {
 				let el = entry.el
 				if ((el === null || el === undefined) && entry.id !== undefined) {
@@ -492,6 +614,29 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 
 			const items = windowRoster.map((entry, i) => {
 				const globalIdx = windowStart + i
+				const anchorEl = () => (railRef.current ? railRef.current.children[i + 1] : null)
+				if (entry.kind === "btw") {
+					// 旁支：菱形，点击回开浮条那一条（不跳转消息——它没有对应的聊天行）。
+					const isBtwActive = btwState.selectedId !== undefined && btwState.selectedId === entry.btwId
+					const label = entry.status === "running" ? "旁支问答（回答中）" : "旁支问答"
+					const hoverText = `${label} · ${entry.preview === undefined || entry.preview === "" ? "（提问内容缺失）" : entry.preview}`
+					return react.createElement("button", {
+						key: `btw:${entry.btwId}`,
+						className: "dsh-node-nav-dot dsh-node-nav-btw"
+							+ (isBtwActive ? " dsh-node-nav-dot-active" : ""),
+						"aria-label": `${label} ${entry.time ? hhmm(entry.time) : ""}：${entry.preview || ""}`,
+						"data-dsh-btw-marker": entry.btwId,
+						onMouseEnter: () => { setHoverIdx(-1); showTextPreview(hoverText, entry.time, anchorEl()) },
+						onMouseLeave: () => { setHoverIdx(-1); hidePreview() },
+						onFocus: () => { setHoverIdx(-1); showTextPreview(hoverText, entry.time, anchorEl()) },
+						onBlur: () => { setHoverIdx(-1); hidePreview() },
+						onClick: () => {
+							const api = btwBridge()
+							if (api === undefined || typeof api.open !== "function") { showMiss("旁支问答插件未就绪（dsh-btw client 未加载）"); return }
+							api.open(entry.btwId)
+						},
+					})
+				}
 				const isActive = globalIdx === activeIdx
 				const unloaded = entry.el === null || entry.el === undefined
 				return react.createElement("button", {
@@ -500,9 +645,9 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 						+ (isActive ? " dsh-node-nav-dot-active" : "")
 						+ (unloaded ? " dsh-node-nav-dot-unloaded" : ""),
 					"aria-label": `跳转到消息 ${entry.time ? hhmm(entry.time) : `#${globalIdx + 1}`}${unloaded ? '(未加载)' : ''}`,
-					onMouseEnter: () => { setHoverIdx(globalIdx); showTextPreview(entry.preview, entry.time, railRef.current ? railRef.current.children[i + 1] : null) },
+					onMouseEnter: () => { setHoverIdx(globalIdx); showTextPreview(entry.preview, entry.time, anchorEl()) },
 					onMouseLeave: () => { setHoverIdx(-1); hidePreview() },
-					onFocus: () => { setHoverIdx(globalIdx); showTextPreview(entry.preview, entry.time, railRef.current ? railRef.current.children[i + 1] : null) },
+					onFocus: () => { setHoverIdx(globalIdx); showTextPreview(entry.preview, entry.time, anchorEl()) },
 					onBlur: () => { setHoverIdx(-1); hidePreview() },
 					onClick: () => { void onNodeClick(entry) },
 				})
@@ -567,6 +712,7 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 			let actions = undefined
 			let unsub = undefined
 			let unsubInfo = undefined
+			let unsubUsers = undefined
 			let disposed = false
 
 			const textAt = (i) => (i >= 0 && i < users.length ? users[i].text : "")
@@ -625,7 +771,7 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 				if (e.key === "ArrowUp") {
 					if (pos >= users.length) {
 						if (draft !== "") return // 基准态且非空：放行光标移动
-						if (users.length === 0) return
+						if (users.length === 0) { sharedFetchUsers(sessionId, true); return }
 						pos = users.length - 1
 					} else if (draft === textAt(pos)) {
 						if (pos === 0) return
@@ -648,6 +794,14 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 			}
 
 			document.addEventListener("keydown", onKeyDown, true)
+			// 列表跟随共享缓存：挂载后新到的消息也能 ↑ 回去。
+			unsubUsers = onUsersUpdated((sid, list) => {
+				if (disposed || sid !== sessionId) return
+				const next = list.filter((u) => u.text !== "[图片]")
+				const atBaseline = pos >= users.length
+				users = next
+				pos = atBaseline ? users.length : Math.min(pos, Math.max(users.length - 1, 0))
+			})
 			// 会话切换订阅：0.1.2 用 sessions.list，0.1.1 回退 currentProvideInfo。
 			const list = ctx.sessions && ctx.sessions.list
 			if (list && typeof list.subscribe === "function") {
@@ -664,6 +818,7 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 				document.removeEventListener("keydown", onKeyDown, true)
 				if (unsub) unsub()
 				if (unsubInfo) unsubInfo()
+				if (unsubUsers) unsubUsers()
 			}
 		}
 
@@ -763,6 +918,7 @@ body[data-ds-dark-theme] .dsh-node-nav-miss { background: #1f242d; color: #e6e9f
 		}
 
 		exports.apply = apply;
+		exports.__test = { mergeBtwMarkers, useBtwState, btwBridge };
 		exports.inject = ["sessions", "conversation", "slots"];
 		return module.exports;
 	}

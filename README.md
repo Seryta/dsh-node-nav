@@ -16,6 +16,7 @@ DSH（DeepSeek Harness）Web GUI 的客户端插件：在聊天区右侧显示�
 | 点击跳转 | scrollIntoView 居中 + 品牌蓝高亮环 1.2 秒 |
 | active 跟随 | 滚动时药丸实时标出视口内最顶部的用户消息 |
 | 输入历史 | 输入框为空时按 ↑ 回填最近一条用户输入，连续 ↑ 翻更早、↓ 翻回；编辑/发送后指针重置 |
+| 旁支问答联动 | 装了 [dsh-btw](https://github.com/Seryta/pi-agents-anywhere) 时，`/btw` 的旁支问答以青色菱形混进节点串（按会话日志顺序），点击把底部浮条开回那一条；未安装时行为完全不变 |
 | details 避让 | 右侧详情面板打开时节点串自动左移 |
 | 深色模式 | 跟随 `body[data-ds-dark-theme]` |
 | reduced-motion | 系统减少动效偏好下禁用动画 |
@@ -48,6 +49,15 @@ DSH（DeepSeek Harness）Web GUI 的客户端插件：在聊天区右侧显示�
 - 开始编辑回填文本、发送或清空后，指针重置（下次 ↑ 从最近一条重新开始）；
 - 菜单打开时（触发词在 draft 中）天然不抢上下键；IME 组合中不拦截；
 - 数据复用 `/plugins/dsh-node-nav/api/users`（仅 `source.kind === 'user'` 的真实输入，纯图片消息 `[图片]` 占位不参与历史）。
+
+## 旁支问答（dsh-btw）联动
+
+装了 dsh-btw 时，它会把当前会话的旁支问答（`/btw`）以**青色菱形**混进同一条节点串——不是第二条轨，所以窗口滑动、active、hover 预览、details 避让都共用一套。
+
+- **顺序**：按会话日志的 `seq` 合并。旁支记录带 `anchorSeq`，用户消息带 `seq`，`seq <= anchorSeq` 的消息排在前面，因此"第几次提问之后的旁支"是精确的，刷新后从日志重建、不需要额外存储；
+- **形状**：用户消息是靛蓝圆点、旁支是青色菱形、底部跳转是灰方块，三种形状一眼可分；当前浮条里显示的那条菱形填色高亮；
+- **点击**：把底部浮条切到那一条（浮条与节点串共用同一个选中状态，‹ › 翻页也会同步高亮），叉掉浮条不会再"丢失"——菱形是常驻入口，点同一条还能重新展开；
+- **桥接协议**：两个插件是独立包，通过最小 window 契约通信——`window.__dshBtw = { version, list(), selected(), open(id), subscribe(fn) }`。dsh-btw 缺席/未加载时本插件行为与从前一致；dsh-btw 单独热重载会换掉该对象，本插件每秒探测一次并在身份变化时重挂订阅。
 
 ## 数据源：服务端会话日志 + DOM 行状态（双轨）
 
@@ -99,6 +109,7 @@ DSH 0.1.5 起官方 `dsh-client-ui-chat` 自带 TurnNavigator 轨（整会话轮
 - `setDraft` 必须绑回实例调用：0.1.2+ 的 `input.for()` 返回 SessionInputShell 实例，其 `setDraft` 是原型方法（内部读 `this.projection.clipboardText`），摘下来单独调用会丢 `this` 并抛 `TypeError`，表现为 ↑/↓ 回填静默失效。插件统一经 `inputSetDraft()` 取绑定后的函数。
 - 输入历史仅覆盖**当前打开的（live）会话**：host 端点只查 attached 会话，未打开的历史会话无 composer 焦点，不适用输入历史。
 - 未加载节点点击依赖页面「加载更早」按钮存在（上限 30 批）；按钮被移除的 harness 版本中，点击未加载节点会提示目标消息未能定位。
+- 旁支菱形的顺序依赖 host 端点返回的 `seq`。端点不可用、退化为纯 DOM 扫描时无从比较，旁支会被追加在节点串末尾（仍可点击、仍按日志顺序）。
 
 ## License
 
