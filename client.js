@@ -326,6 +326,20 @@ window.__ModuleLoader__.load({
 				.then((found) => (found !== null ? found : buttonPageUntil(id)))
 		}
 
+		/**
+		 * 节点窗口起点。正常情况跟随 active 居中；**没有任何 active**（视口里
+		 * 一条已加载的用户消息都没有，例如分页窗口停在回合中间）时贴住末端：
+		 * 这时聊天区显示的是最新一页，节点串也该停在最新节点上。旧实现把
+		 * activeIdx=-1 直接当 0 用，窗口滑到最早 15 条（全都未加载），
+		 * 末端混进来的旁支菱形永远进不了可见窗口。
+		 */
+		function windowStartOf(activeIdx, length, size) {
+			if (length <= size) return 0
+			const focus = activeIdx >= 0 ? activeIdx : length - 1
+			const half = Math.floor((size - 1) / 2)
+			return Math.min(Math.max(focus - half, 0), length - size)
+		}
+
 		/** 滚动会话流到底部(最新消息)。 */
 		function scrollToBottom() {
 			const scroller = scrollerOf()
@@ -699,13 +713,8 @@ body[data-ds-dark-theme] .dsh-node-nav-btw.dsh-node-nav-dot-active { background:
 			// 显示窗口：最多 WINDOW 个节点，窗口随 active 平移（阅读到哪里、
 			// 节点串滑到哪里，无需滚动条）；窗口外两端用渐隐提示。
 			const WINDOW = 15
-			let windowStart = 0
-			let windowRoster = roster
-			if (roster.length > WINDOW) {
-				const half = Math.floor((WINDOW - 1) / 2)
-				windowStart = Math.min(Math.max(activeIdx - half, 0), roster.length - WINDOW)
-				windowRoster = roster.slice(windowStart, windowStart + WINDOW)
-			}
+			const windowStart = windowStartOf(activeIdx, roster.length, WINDOW)
+			const windowRoster = roster.length > WINDOW ? roster.slice(windowStart, windowStart + WINDOW) : roster
 			const hasMoreUp = windowStart > 0
 			const hasMoreDown = windowStart + WINDOW < roster.length
 
@@ -1017,7 +1026,7 @@ body[data-ds-dark-theme] .dsh-node-nav-btw.dsh-node-nav-dot-active { background:
 		}
 
 		exports.apply = apply;
-		exports.__test = { mergeBtwMarkers, useBtwState, btwBridge, sessionPageUntil, olderButton, clientSession };
+		exports.__test = { mergeBtwMarkers, useBtwState, btwBridge, sessionPageUntil, olderButton, clientSession, windowStartOf };
 		exports.inject = ["sessions", "conversation", "slots"];
 		return module.exports;
 	}
