@@ -26,7 +26,11 @@ window.__ModuleLoader__.load({
 		let react = require("react");
 
 		const PREVIEW_CHARS = 300
-		const LOAD_BATCH_MAX = 30
+		/**
+		 * 按钮分页的时间预算（毫秒）。主路径（官方会话控制器 loadOlder）不设死线：
+		 * 它翻到 hasMore=false 或连续空转就停，大会话也不会被「30 批」这种拍脑袋上限截断。
+		 */
+		const LOAD_TIMEOUT_MS = 60000
 
 		/** 用户消息列表共享缓存：sessionId → users:[{id,time,text}]（导航与输入历史共用）。 */
 		var usersCache = new Map()
@@ -34,6 +38,11 @@ window.__ModuleLoader__.load({
 		var USERS_CACHE_MAX = 10
 		/** 在途请求：sessionId → promise（去重：导航/历史/重拉并发时只发一次请求）。 */
 		var inflightUsers = new Map()
+		/**
+		 * 客户端插件上下文（apply 时捕获）。点击未加载节点时用它取会话实例，
+		 * 调官方 `loadOlder()` 增量翻页——不依赖「加载更早」按钮的文本与 disabled 态。
+		 */
+		var pluginCtx = undefined
 		/**
 		 * 缓存更新订阅：rail 每次防抖重拉都会刷新 usersCache，历史模块据此把
 		 * 「页面挂载之后才到达的用户消息」也纳入 ↑/↓。旧实现只在 rewire 时读一次
@@ -211,13 +220,110 @@ window.__ModuleLoader__.load({
 			}
 		}
 
-		/** 页面自带的「加载更早」按钮。 */
+		/**
+		 * 页面自带的「加载更早」控件。分页期间按钮是 disabled 且标签被换成
+		 * 「加载中…」（dsh-client-ui-chat 0.2.x：`loadingOlder ? t("loading") :
+		 * t("chat.loadOlder")`），只按「加载更早」文本找会在第一轮就返回 null，
+		 * 于是被误判成「没有更早历史」而放弃——这正是点击很早节点失败的主因。
+		 * 因此先按结构定位（`div[class*="_older"] > button`），文本只作老版兜底。
+		 */
+		var olderBtnRef = null
 		function olderButton() {
-			const buttons = document.querySelectorAll('button')
-			for (const b of buttons) {
-				if ((b.textContent ?? '').includes('加载更早')) return b
+			if (olderBtnRef !== null && olderBtnRef.isConnected) return olderBtnRef
+			const structural = document.querySelector('div[class*="_older"] > button')
+			if (structural !== null) { olderBtnRef = structural; return structural }
+			for (const b of document.querySelectorAll('button')) {
+				const t = (b.textContent ?? '').trim()
+				if (t === '加载更早' || t === '加载中…' || t === 'Load earlier' || t === 'Loading…') {
+					olderBtnRef = b
+					return b
+				}
 			}
+			olderBtnRef = null
 			return null
+		}
+
+		/**
+		 * 取会话实例。`sessions` 服务对外的门面只有 list/scope/retain…，
+		 * 真正的 Session 实例挂在 `sessions.manager.get(id)`（0.2.x）；
+		 * 更早的运行时代替是 `sessions.get(id)`。两者都没有就返回 undefined。
+		 */
+		function clientSession(ctx, sessionId) {
+			const sessions = ctx === undefined ? undefined : ctx.sessions
+			if (sessions === undefined || sessions === null) return undefined
+			const manager = sessions.manager
+			if (manager !== undefined && manager !== null && typeof manager.get === 'function') {
+				try { return manager.get(sessionId) } catch { /* 落到下一支 */ }
+			}
+			if (typeof sessions.get === 'function') {
+				try { return sessions.get(sessionId) } catch { /* 没有可用的会话实例 */ }
+			}
+			return undefined
+		}
+
+		/**
+		 * 官方增量分页：调用会话控制器 `loadOlder()` 一页页往前翻（每页到 DOM
+		 * 就停），锚点行一出现立即返回。比 `loadThrough` 好在**边翻边提交**：
+		 * 目标只隔几页时立刻收工，不必把到 seq 0 的整条历史都翻完。
+		 * 没有会话实例 / 会话未打开 / 已经没有更早历史时返回 null。
+		 */
+		function sessionPageUntil(id, session, onPage) {
+			return new Promise((resolve) => {
+				if (session === undefined || session === null || typeof session.loadOlder !== 'function') { resolve(null); return }
+				let pages = 0
+				let stalled = 0
+				let lastBase = undefined
+				const step = () => {
+					const el = anchorOfId(id)
+					if (el !== null) { resolve(el); return }
+					if (session.openState !== undefined && session.openState !== 'open') { resolve(null); return }
+					if (session.loadingOlder === true) { setTimeout(step, 120); return }
+					if (session.hasMore === false) { resolve(null); return }
+					// baseSeq 是当前窗口最早事件的 seq：连续几页不往前挪说明 loader 空转。
+					const base = session.baseSeq
+					if (base !== undefined && base === lastBase) {
+						stalled++
+						if (stalled >= 3) { resolve(null); return }
+					} else {
+						stalled = 0
+					}
+					lastBase = base
+					Promise.resolve(session.loadOlder()).then(() => {
+						pages++
+						if (onPage !== undefined) { try { onPage(pages) } catch { /* 提示失败不影响翻页 */ } }
+						setTimeout(step, 80)
+					}, () => resolve(null))
+				}
+				step()
+			})
+		}
+
+		/**
+		 * 回退：点页面自带的「加载更早」按钮，直到锚点行进入 DOM。
+		 * 分页期间按钮 disabled 且标签变「加载中…」，所以要等它恢复可点再点，
+		 * 不能把「按钮此刻不存在」当成「没有更早历史」。
+		 */
+		function buttonPageUntil(id) {
+			return new Promise((resolve) => {
+				const deadline = Date.now() + LOAD_TIMEOUT_MS
+				const step = () => {
+					const el = anchorOfId(id)
+					if (el !== null) { resolve(el); return }
+					if (Date.now() >= deadline) { resolve(null); return }
+					const btn = olderButton()
+					if (btn === null) { resolve(null); return }
+					if (btn.disabled) { setTimeout(step, 200); return }
+					btn.click()
+					setTimeout(step, 200)
+				}
+				step()
+			})
+		}
+
+		/** 按需加载：先走官方会话控制器，拿不到再退回按钮分页。找到返回行，否则 null。 */
+		function loadUntilVisible(id, sessionId, onPage) {
+			return sessionPageUntil(id, clientSession(pluginCtx, sessionId), onPage)
+				.then((found) => (found !== null ? found : buttonPageUntil(id)))
 		}
 
 		/** 滚动会话流到底部(最新消息)。 */
@@ -239,28 +345,6 @@ window.__ModuleLoader__.load({
 			setTimeout(() => { row.style.outline = "none" }, 1200)
 			return true
 		}
-
-		/**
-		 * 按需加载:连续触发页面「加载更早」直到目标消息行进入 DOM
-		 * (上限 LOAD_BATCH_MAX 批)。返回找到的行或 null。
-		 */
-		function loadUntilVisible(id) {
-			return new Promise((resolve) => {
-				let tries = 0
-				const step = () => {
-					const el = anchorOfId(id)
-					if (el !== null) { resolve(el); return }
-					const btn = olderButton()
-					if (btn === null) { resolve(null); return }
-					if (tries >= LOAD_BATCH_MAX) { resolve(null); return }
-					tries++
-					btn.click()
-					setTimeout(step, 400)
-				}
-				step()
-			})
-		}
-
 
 		const CSS_TEXT = `
 .dsh-node-nav-rail { position: fixed; right: 28px; top: 50%; transform: translateY(-50%); width: 16px; max-height: calc(100vh - 32px); overflow-y: auto; scrollbar-width: none; z-index: 1000; display: flex; flex-direction: column; align-items: center; gap: 9px; padding: 14px 0; }
@@ -456,7 +540,8 @@ body[data-ds-dark-theme] .dsh-node-nav-btw.dsh-node-nav-dot-active { background:
 					if (typeof sessionId !== "string" || sessionId === "") { setRemoteUsers([]); return }
 					sharedFetchUsers(sessionId, true)
 						.then((users) => {
-							setRemoteUsers(users.map((u) => ({ id: u.id, time: u.time, text: u.text })))
+							// seq 必须带下来：点击未加载节点时用官方 loadThrough(seq) 翻页。
+							setRemoteUsers(users.map((u) => ({ id: u.id, seq: u.seq, time: u.time, text: u.text })))
 						})
 						.catch(() => { setRemoteUsers([]) })
 				}
@@ -587,13 +672,25 @@ body[data-ds-dark-theme] .dsh-node-nav-btw.dsh-node-nav-dot-active { background:
 				window.clearTimeout(missTimer.current)
 				missTimer.current = window.setTimeout(() => setMiss(""), 3000)
 			}
+			/** 跳转进行中的提示：不自动消失，由结束时清除（大会话翻页要几秒）。 */
+			const showHint = (text) => {
+				window.clearTimeout(missTimer.current)
+				setMiss(text)
+			}
+			const hideHint = () => setMiss("")
+
 			const onNodeClick = async (entry) => {
 				let el = entry.el
 				if ((el === null || el === undefined) && entry.id !== undefined) {
-					el = await loadUntilVisible(entry.id)
+					showHint('正在加载历史…')
+					try {
+						el = await loadUntilVisible(entry.id, sessionId, (pages) => showHint(`正在加载历史… 第 ${pages} 页`))
+					} finally {
+						hideHint()
+					}
 				}
 				if (el === null || el === undefined || !jumpToRow(el)) {
-					showMiss('目标消息未能定位(历史加载失败或已超过批次上限)')
+					showMiss('目标消息未能定位(历史加载失败或该会话已不在当前视图)')
 				}
 			}
 
@@ -897,6 +994,7 @@ body[data-ds-dark-theme] .dsh-node-nav-btw.dsh-node-nav-dot-active { background:
 
 		function apply(ctx) {
 			ctx.effect(() => {
+				pluginCtx = ctx
 				const disposeHistory = installInputHistory(ctx)
 				const disposeOfficialRail = installOfficialRailOverride()
 				const style = document.createElement("style")
@@ -909,6 +1007,7 @@ body[data-ds-dark-theme] .dsh-node-nav-btw.dsh-node-nav-dot-active { background:
 					inject: () => ({ hooks: { sessionId: sessionIdSource } }),
 				}, NodeNavRail)
 				return () => {
+					if (pluginCtx === ctx) pluginCtx = undefined
 					disposeHistory()
 					disposeOfficialRail()
 					offSlot()
@@ -918,7 +1017,7 @@ body[data-ds-dark-theme] .dsh-node-nav-btw.dsh-node-nav-dot-active { background:
 		}
 
 		exports.apply = apply;
-		exports.__test = { mergeBtwMarkers, useBtwState, btwBridge };
+		exports.__test = { mergeBtwMarkers, useBtwState, btwBridge, sessionPageUntil, olderButton, clientSession };
 		exports.inject = ["sessions", "conversation", "slots"];
 		return module.exports;
 	}

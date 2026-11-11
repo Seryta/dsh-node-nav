@@ -65,7 +65,7 @@ DSH（DeepSeek Harness）Web GUI 的客户端插件：在聊天区右侧显示�
 - **DOM 行状态**：锚点 key 形如 `<seq>:input-message<uuid>`，uuid 即消息 id，用 `[data-chat-anchor-key$="<id>"]` 判定该消息行是否已加载进页面；
 - 端点不可用/冷会话（未 attached）时回退到纯 DOM 扫描。
 
-未加载的节点以虚线半透明显示；点击时连续触发页面「加载更早」（上限 30 批）直到该行进入 DOM，再滚动定位。hover 预览显示服务端全文与时间。
+未加载的节点以虚线半透明显示；点击时翻页直到该行进入 DOM，再滚动定位。翻页走会话控制器的 `loadOlder()`（一页一页往前、边翻边提交，锚点一出现立刻停），运行时没有会话实例时才回退到点页面「加载更早」按钮。翻页期间节点条上显示「正在加载历史… 第 N 页」。hover 预览显示服务端全文与时间。
 
 ## 安装
 
@@ -108,7 +108,8 @@ DSH 0.1.5 起官方 `dsh-client-ui-chat` 自带 TurnNavigator 轨（整会话轮
 - 输入历史与跳转依赖 dsh 客户端契约：`[data-chat-anchor-key]`（行锚点）、`[data-composer-card]`（composer 容器）与输入状态/写入口——0.1.2+ 走 `ctx.conversation.input.for(scope)` 的 `state` + `setDraft`，0.1.1 走 provide 通道 `hooks.input` / `props.inputActions`。harness 大版本改动这些契约时需同步适配。
 - `setDraft` 必须绑回实例调用：0.1.2+ 的 `input.for()` 返回 SessionInputShell 实例，其 `setDraft` 是原型方法（内部读 `this.projection.clipboardText`），摘下来单独调用会丢 `this` 并抛 `TypeError`，表现为 ↑/↓ 回填静默失效。插件统一经 `inputSetDraft()` 取绑定后的函数。
 - 输入历史仅覆盖**当前打开的（live）会话**：host 端点只查 attached 会话，未打开的历史会话无 composer 焦点，不适用输入历史。
-- 未加载节点点击依赖页面「加载更早」按钮存在（上限 30 批）；按钮被移除的 harness 版本中，点击未加载节点会提示目标消息未能定位。
+- 未加载节点点击的主路径依赖会话控制器契约：Session 实例从 `ctx.sessions.manager.get(id)`（0.2.x）或 `ctx.sessions.get(id)`（更早）取得，用 `loadOlder()` 增量翻页；两者都拿不到时回退到点页面「加载更早」按钮（该按钮分页期间会变成 `disabled` + 「加载中…」，故按 `div[class*="_older"] > button` 结构定位，不按文本）。真正翻到 `hasMore=false` 仍找不到才提示「目标消息未能定位」。
+- 很早的节点在有上万条事件的会话里需要翻十几页（每页由 host 端读日志准备，实测 12k 事件的会话约 30–50 秒），这是 harness 自身分页模型的成本，不是本插件额外开销。
 - 旁支菱形的顺序依赖 host 端点返回的 `seq`。端点不可用、退化为纯 DOM 扫描时无从比较，旁支会被追加在节点串末尾（仍可点击、仍按日志顺序）。
 
 ## License
