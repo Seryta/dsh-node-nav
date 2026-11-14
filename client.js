@@ -14,6 +14,8 @@
  * - 未加载节点(虚线半透明):点击先连续触发页面「加载更早」直到该行进入
  *   DOM(上限 30 批),再跳转;hover 预览直接显示服务端全文(含时间);
  * - scroll-spy:active 药丸标出视口内最顶部用户消息(仅对已加载行);
+ * - rail 接管滚轮:悬停节点串时滚轮手动翻节点窗口(不滚动正文),滚正文/点节点
+ *   即回到跟随阅读位置;
  * - rail 底端固定方形「跳到底部」节点;
  * - details 面板打开时自动左移避让;深色模式;
  *   reduced-motion 禁用动画。
@@ -340,6 +342,38 @@ window.__ModuleLoader__.load({
 			return Math.min(Math.max(focus - half, 0), length - size)
 		}
 
+		/** 轨上滚轮一格：累计 40px 翻一个节点（触控板小增量攒够一格再走）。 */
+		const WHEEL_STEP_PX = 40
+
+		/**
+		 * 滚轮 deltaY 换算成像素。deltaMode：0=像素、1=行、2=页。
+		 * 行模式按 16px/行折算（Chromium 的实现值）；页模式按轨高折算。
+		 */
+		function wheelDeltaPx(deltaY, deltaMode, pageHeight) {
+			if (deltaMode === 1) return deltaY * 16
+			if (deltaMode === 2) return deltaY * (pageHeight > 0 ? pageHeight : 1)
+			return deltaY
+		}
+
+		/**
+		 * 轨上滚轮增量 → 节点窗口起点。按 WHEEL_STEP_PX 一格折算位移，两端夹紧；
+		 * 不足一格的余量原样返回，留给下一次 wheel（触控板连续小增量因此能攒够一格）。
+		 * 顶到任一端后余量清零：继续同向滚不应攒成回头时的"暴冲"。
+		 */
+		function wheelWindowStart(start, amount, maxStart) {
+			if (maxStart <= 0) return { start: 0, rest: 0 }
+			let next = Math.min(Math.max(start, 0), maxStart)
+			let rest = amount
+			const dir = rest > 0 ? 1 : -1
+			while (Math.abs(rest) >= WHEEL_STEP_PX) {
+				const candidate = Math.min(Math.max(next + dir, 0), maxStart)
+				rest -= dir * WHEEL_STEP_PX
+				if (candidate === next) { rest = 0; break }
+				next = candidate
+			}
+			return { start: next, rest }
+		}
+
 		/** 滚动会话流到底部(最新消息)。 */
 		function scrollToBottom() {
 			const scroller = scrollerOf()
@@ -545,6 +579,12 @@ body[data-ds-dark-theme] .dsh-node-nav-btw.dsh-node-nav-dot-active { background:
 			const previewRef = react.useRef(null)
 			const missTimer = react.useRef(0)
 			const btwState = useBtwState()
+			/** 手动翻页的窗口起点；null = 跟随阅读位置（默认）。 */
+			const [railStartOverride, setRailStartOverride] = react.useState(null)
+			/** 轨上滚轮累计的像素余量（不足一格的部分留给下一次 wheel）。 */
+			const railWheelAcc = react.useRef(0)
+			/** wheel 回调经 ref 读最新窗口参数，避免监听器闭包拿旧值。 */
+			const railWheelMeta = react.useRef({ start: 0, maxStart: 0, length: 0 })
 
 			// 服务端全量列表:会话切换或 DOM 变化(新消息/加载历史)时防抖刷新
 			react.useEffect(() => {
@@ -589,6 +629,9 @@ body[data-ds-dark-theme] .dsh-node-nav-btw.dsh-node-nav-dot-active { background:
 				}
 			}, [])
 
+			// 会话切换：手动翻页窗口作废，回到跟随新会话的阅读位置。
+			react.useEffect(() => { setRailStartOverride(null) }, [sessionId])
+
 			// active 药丸:视口内最顶部的已加载节点行（数据源与节点串同源——
 			// roster 的锚点行；不再扫 DOM userRows，避免 assistant/steering 等
 			// 非用户消息行混入导致 DOM 序与节点序错位）。activeIdx 即 roster
@@ -615,7 +658,12 @@ body[data-ds-dark-theme] .dsh-node-nav-btw.dsh-node-nav-dot-active { background:
 				const onScroll = () => {
 					if (ticking) return
 					ticking = true
-					requestAnimationFrame(() => { ticking = false; compute() })
+					requestAnimationFrame(() => {
+						ticking = false
+						compute()
+						// 滚动正文 = 回到跟随阅读位置；手动翻页状态只在轨上滚轮期间有效。
+						setRailStartOverride((prev) => (prev === null ? prev : null))
+					})
 				}
 				document.addEventListener('scroll', onScroll, { capture: true, passive: true })
 				compute()
@@ -638,6 +686,33 @@ body[data-ds-dark-theme] .dsh-node-nav-btw.dsh-node-nav-dot-active { background:
 				measure()
 				return () => window.clearInterval(timer)
 			}, [])
+
+			// 当前是否在对话页：rail 只在对话流存在时渲染。
+			const visible = flowOf() !== null
+
+			// 轨上滚轮手动翻页：悬停节点串时滚轮翻节点窗口，不滚动正文。
+			// 只在窗口可滑动（节点数 > 一窗）时接管；翻到任一端后余量清零并放行
+			// 默认行为（极短视口下 rail 自身溢出时仍可原生滚动到底部节点）。
+			react.useEffect(() => {
+				if (!visible) return
+				const rail = railRef.current
+				if (rail === null) return
+				const onWheel = (event) => {
+					const meta = railWheelMeta.current
+					if (meta.length <= WINDOW || meta.maxStart <= 0) return
+					const px = wheelDeltaPx(event.deltaY, event.deltaMode, rail.clientHeight)
+					if (px === 0) return
+					// 反向滚动先清掉上一方向的余量，避免回头时"暴冲"。
+					if (railWheelAcc.current !== 0 && (railWheelAcc.current > 0) !== (px > 0)) railWheelAcc.current = 0
+					const moved = wheelWindowStart(meta.start, railWheelAcc.current + px, meta.maxStart)
+					railWheelAcc.current = moved.rest
+					if (moved.start === meta.start) return
+					event.preventDefault()
+					setRailStartOverride(moved.start)
+				}
+				rail.addEventListener("wheel", onWheel, { passive: false })
+				return () => rail.removeEventListener("wheel", onWheel)
+			}, [visible])
 
 			// roster 组装:服务端全量为主;端点空时 fallback 纯 DOM 行
 			let roster
@@ -694,6 +769,9 @@ body[data-ds-dark-theme] .dsh-node-nav-btw.dsh-node-nav-dot-active { background:
 			const hideHint = () => setMiss("")
 
 			const onNodeClick = async (entry) => {
+				// 点击节点 = 回到跟随阅读位置：手动翻页窗口作废（跳转本身也会
+				// 触发 scroll 再清一次；未加载节点的翻页路径没有 scroll）。
+				setRailStartOverride(null)
 				let el = entry.el
 				if ((el === null || el === undefined) && entry.id !== undefined) {
 					showHint('正在加载历史…')
@@ -708,12 +786,14 @@ body[data-ds-dark-theme] .dsh-node-nav-btw.dsh-node-nav-dot-active { background:
 				}
 			}
 
-			const visible = flowOf() !== null
-
-			// 显示窗口：最多 WINDOW 个节点，窗口随 active 平移（阅读到哪里、
-			// 节点串滑到哪里，无需滚动条）；窗口外两端用渐隐提示。
+			// 显示窗口：最多 WINDOW 个节点。默认随 active 平移（阅读到哪里、
+			// 节点串滑到哪里，无需滚动条）；在轨上滚轮可手动把窗口翻到任意一段，
+			// 滚正文或点节点后回到跟随。窗口外两端用渐隐提示。
 			const WINDOW = 15
-			const windowStart = windowStartOf(activeIdx, roster.length, WINDOW)
+			const maxStart = Math.max(0, roster.length - WINDOW)
+			const followStart = windowStartOf(activeIdx, roster.length, WINDOW)
+			const windowStart = railStartOverride === null ? followStart : Math.min(Math.max(railStartOverride, 0), maxStart)
+			railWheelMeta.current = { start: windowStart, maxStart, length: roster.length }
 			const windowRoster = roster.length > WINDOW ? roster.slice(windowStart, windowStart + WINDOW) : roster
 			const hasMoreUp = windowStart > 0
 			const hasMoreDown = windowStart + WINDOW < roster.length
@@ -768,7 +848,7 @@ body[data-ds-dark-theme] .dsh-node-nav-btw.dsh-node-nav-dot-active { background:
 				onMouseLeave: hidePreview,
 				onFocus: () => { setHoverIdx(-1); showTextPreview('跳到底部(最新消息)', undefined, railRef.current ? railRef.current.children[bottomIdx] : null) },
 				onBlur: hidePreview,
-				onClick: scrollToBottom,
+				onClick: () => { setRailStartOverride(null); scrollToBottom() },
 			}))
 
 			return react.createElement(
@@ -1026,7 +1106,7 @@ body[data-ds-dark-theme] .dsh-node-nav-btw.dsh-node-nav-dot-active { background:
 		}
 
 		exports.apply = apply;
-		exports.__test = { mergeBtwMarkers, useBtwState, btwBridge, sessionPageUntil, olderButton, clientSession, windowStartOf };
+		exports.__test = { mergeBtwMarkers, useBtwState, btwBridge, sessionPageUntil, olderButton, clientSession, windowStartOf, wheelDeltaPx, wheelWindowStart };
 		exports.inject = ["sessions", "conversation", "slots"];
 		return module.exports;
 	}
